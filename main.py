@@ -224,16 +224,31 @@ def check_sub(user_id):
 
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
-
-   user_id = message.from_user.id
+    # --- كود الحماية ضد التكرار (الموجود لديك سابقاً) ---
+    user_id = message.from_user.id
     current_time = time.time()
 
-    # فحص التكرار السريع
     if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.5:
-        bot.reply_to(message, "رووووق ✋.. انتظر ثانية بين الطلبات!")
+        try:
+            bot.reply_to(message, "رووووق ✋ .. انتظر ثانية بين الطلبات!")
+        except Exception:
+            pass
         return
 
     last_interaction_time[user_id] = current_time
+    # -----------------------------------------------
+
+    # --- حماية البوت من الانهيار عند الحظر أو الأخطاء ---
+    try:
+        # هنا يكمل كودك القديم بالكامل للرد على الأزرار والقوائم
+        chat_id = message.chat.id
+        text = message.text
+        
+        # (بقية الشروط والردود الخاصة بك مثل Send Message أو Reply)
+        
+    except Exception as e:
+        print(f"حدث خطأ مع المستخدم {user_id}: {e}")
+
 
     
     chat_id = message.chat.id
