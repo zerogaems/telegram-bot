@@ -30,12 +30,31 @@ CHANNEL_USERNAME = "@Hamak456"  # ضع معرف قناتك هنا
 bot = telebot.TeleBot(TOKEN)
 user_states = {}
 
-@bot.message_handler(content_types=['document', 'photo', 'audio', 'video'])
-def print_my_file_id(message):
-    if message.document:
-        f_id = message.document.file_id
-        print(f"MY BOT FILE ID: {f_id}")
-        bot.reply_to(message, f"هذا هو الـ File ID الخاص ببوتك:\n{f_id}", parse_mode="Markdown")
+ADMIN_ID = 7547218555
+
+@bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice'])
+def send_file_id(message):
+    # التحقق من أن أرسل الملف هو الأدمن فقط
+    if message.from_user.id == ADMIN_ID:
+        file_id = None
+        if message.document:
+            file_id = message.document.file_id
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+        elif message.video:
+            file_id = message.video.file_id
+        elif message.audio:
+            file_id = message.audio.file_id
+        elif message.voice:
+            file_id = message.voice.file_id
+
+        if file_id:
+            bot.reply_to(message, f"🔑 **File ID الخاص بالأدمن:**\n\n`{file_id}`", parse_mode="Markdown")
+    else:
+        # إذا كان مستخدماً عادياً لن يرد عليه بالـ File ID
+        bot.reply_to(message, "عذراً، هذه الميزة مخصصة لإدارة البوت فقط.")
+
+
 
 database = {
     # ------------ السنة الأولى ------------
