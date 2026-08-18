@@ -1,7 +1,9 @@
 import os
 from threading import Thread
 from flask import Flask
+import time
 
+last_interaction_time = {}
 # سيرفر خفيف لإبقاء الخدمة نشطة في Render
 app = Flask('')
 
@@ -56,8 +58,8 @@ def send_file_id(message):
 
 
 
-database = {
-    # ------------ السنة الأولى ------------
+database = {  
+   # ------------ السنة الأولى ------------
     "year_1_sem_1": [
         {"name": "ري1 📐", "content": {"محاضرة 1 📄": "BQACAgQAAxkBAAICD2qEBmeR935OBUjFG8Ont08sWztlAAKoIAAC18EhUMGVwq8N9P5HPQQ","📝 دورات سابقة": "BQACAgQAAxkBAAICEWqEBsO8pAchkmOl8-A4CyLXSQn-AALJHAACCa4gUMy9w9nebpVYPQQ"}},
         {"name": "فيزيا ⚡", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
@@ -222,6 +224,18 @@ def check_sub(user_id):
 
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
+
+   user_id = message.from_user.id
+    current_time = time.time()
+
+    # فحص التكرار السريع
+    if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.5:
+        bot.reply_to(message, "رووووق ✋.. انتظر ثانية بين الطلبات!")
+        return
+
+    last_interaction_time[user_id] = current_time
+
+    
     chat_id = message.chat.id
     text = message.text
     user_id = message.from_user.id
