@@ -230,7 +230,7 @@ def handle_all_messages(message):
 
     if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.5:
         try:
-            bot.reply_to(message, "رووووق ✋ .. انتظر ثانية بين الطلبات!")
+            bot.reply_to(message, "رووووق ✋ ليش مستعجل رجاع اطلب الطلب بهداوة !")
         except Exception:
             pass
         return
