@@ -656,11 +656,13 @@ def callback_handler(call):
                 bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
                 bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
                 user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
-                bot.send_message(call.message.chat.id, "   f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
-                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
-                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"👇 **يرجى اختيار السنة الدراسية للبدء:** ",
+                bot.send_message(call.message.chat.id, " 👋  أهلاً بك يا  Hiedara Sabra!
+
+🎓 مرحباً بك في بوت الاتصالات المساعد.
+🎓 هذا البوت باشراف ممثل الاتصالات.
+📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.
+
+👇 يرجى اختيار السنة الدراسية للبدء: ",
                                  
                
                                  
