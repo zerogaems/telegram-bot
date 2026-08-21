@@ -209,70 +209,31 @@ Thread(target=auto_backup_thread, daemon=True).start()
 # ==========================================
 
 database = {  
-    # ------------ السنة الأولى ------------
     "year_1_sem_1": [
-        {"name": "ري1 📐", "content": {"محاضرة 1 📄": "BQACAgQAAxkBAAICD2qEBmeR935OBUjFG8Ont08sWztlAAKoIAAC18EhUMGVwq8N9P5HPQQ", "📝 دورات سابقة": "BQACAgQAAxkBAAICEWqEBsO8pAchkmOl8-A4CyLXSQn-AALJHAACCa4gUMy9w9nebpVYPQQ"}},
-        {"name": "فيزيا ⚡", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "تقانة 💻", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "خوارزميات 🧩", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "لغة1 🇬🇧", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "حماية بيئة 🌿", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "لغة عربية 📖", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}}
+        {"name": "ري1 📐", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "فيزيا ⚡", "content": ["محاضرة 1 📄", "محاضرة 2 📄", "📝 دورات سابقة"]},
+        {"name": "تقانة 💻", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "خوارزميات 🧩", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "لغة1 🇬🇧", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "حماية بيئة 🌿", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "لغة عربية 📖", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]}
     ],
     "year_1_sem_2": [
-        {"name": "ري2 📐", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "ميكانيك ⚙️", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "برمجة 💻", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "لغة2 🇬🇧", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "اسس كهربا 🔌", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "صحة عامة 🏥", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "ثقافة 📚", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "محاضرة 2 📄": "PASTE_FILE_ID_HERE", "محاضرة 3 📄": "PASTE_FILE_ID_HERE", "محاضرة 4 📄": "PASTE_FILE_ID_HERE", "محاضرة 5 📄": "PASTE_FILE_ID_HERE", "محاضرة 6 📄": "PASTE_FILE_ID_HERE", "محاضرة 7 📄": "PASTE_FILE_ID_HERE", "محاضرة 8 📄": "PASTE_FILE_ID_HERE", "محاضرة 9 📄": "PASTE_FILE_ID_HERE", "محاضرة 10 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}}
+        {"name": "ري2 📐", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "ميكانيك ⚙️", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "برمجة 💻", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "لغة2 🇬🇧", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "اسس كهربا 🔌", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "صحة عامة 🏥", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]},
+        {"name": "ثقافة 📚", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]}
     ],
-
-    # ------------ السنة الثانية ------------
     "year_2_sem_1": [
-        {"name": "ري3 📐", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "برمجة غرضية التوجه 💻", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "الكترون 🔌", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "دارات ⚡", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "بنى 🏗️", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "لغة3 🇬🇧", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "تصميم 🎨", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}}
+        {"name": "ري3 📐", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]}
     ],
     "year_2_sem_2": [
-        {"name": "ري4 📐", "content": {"محاضرة 1 📄": "BQACAgQAAxkBAAEtuFJqhAKq9r7dkjf7LeWtWB_jxb-uZAACqCAAAtfBIVDjAgdIdi8NOT0E", "📝 دورات سابقة": "BQACAgQAAxkBAAEtuD1qg_8olRC5E90Z_jmuzCOz01WgFAAC_B0AAoW5IFKzCUj-ilqa9z0E"}},
-        {"name": "تمثيلية 📊", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "مضخمات 🔊", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "اقتصاد 💰", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "انتشار 📡", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "اشارات 📶", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}},
-        {"name": "لغة4 🇬🇧", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE", "📝 دورات سابقة": "PASTE_FILE_ID_HERE"}}
-    ],
-
-    # ------------ السنة الثالثة ------------
-    "year_3_sem_1": [
-        {"name": "رقمية 🔢", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}},
-        {"name": "بنية حاسب 🖥️", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
-    ],
-    "year_3_sem_2": [
-        {"name": "دارات متكاملة 🎛️", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
-    ],
-    # ------------ السنة الرابعة ------------
-    "year_4_sem_1": [
-        {"name": "مادة 1 - س4 ف1 📚", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
-    ],
-    "year_4_sem_2": [
-        {"name": "مادة 1 - س4 ف2 📚", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
-    ],
-    # ------------ السنة الخامسة ------------
-    "year_5_sem_1": [
-        {"name": "مادة 1 - س5 ف1 🎓", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
-    ],
-    "year_5_sem_2": [
-        {"name": "مشروع التخرج 🎓", "content": {"محاضرة 1 📄": "PASTE_FILE_ID_HERE"}}
+        {"name": "ري4 📐", "content": ["محاضرة 1 📄", "📝 دورات سابقة"]}
     ]
 }
-
 
 # ==========================================
 # 3. لوحات المفاتيح (Keyboards)
@@ -559,6 +520,7 @@ def handle_all_messages(message):
         # ---- التنقل الرئيسي ----
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
+            first_name = message.from_user.first_name if message.from_user and message.from_user.first_name else "المهندس"
             welcome_text = (
                 f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
@@ -640,6 +602,7 @@ def handle_all_messages(message):
                     bot.send_message(
                         chat_id, 
                         f"⏳ **المحاضرة لم تُعطَ بعد**\n\n"
+                        f"📖 لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.\n"
                         f"🔔 سيتم إدراجها فور صدورها رسمياً.", 
                         parse_mode="Markdown"
                     )
@@ -656,17 +619,17 @@ def callback_handler(call):
                 bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
                 bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
                 user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
-                bot.send_message(call.message.chat.id, " 👋  أهلاً بك يا  Hiedara Sabra!
-
-🎓 مرحباً بك في بوت الاتصالات المساعد.
-🎓 هذا البوت باشراف ممثل الاتصالات.
-📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.
-
-👇 يرجى اختيار السنة الدراسية للبدء: ",
-                                 
-               
-                                 
-                                 reply_markup=get_years_keyboard())
+                
+                # الرسالة المحدثة الأنيقة بعد الضغط على أزرار التحقق من الاشتراك
+                first_name = call.from_user.first_name if call.from_user and call.from_user.first_name else "المهندس"
+                welcome_text = (
+                   f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
+                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
+                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
+                )
+                bot.send_message(call.message.chat.id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
             else:
                 bot.answer_callback_query(call.id, "❌ أنت غير مشترك في القناة بعد!", show_alert=True)
     except Exception as e:
