@@ -524,8 +524,8 @@ def handle_all_messages(message):
             welcome_text = (
                 f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                 f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
                 f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
             )
             bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
@@ -617,16 +617,21 @@ def callback_handler(call):
         if call.data == "check_subscription":
             if check_sub(call.from_user.id):
                 bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
-                bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+                
+                # إخفاء/حذف رسالة الاشتراك بشكل آمن بدون إيقاف الكود عند الفشل
+                try:
+                    bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+                except Exception:
+                    pass
+
                 user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
                 
-                # الرسالة المحدثة الأنيقة بعد الضغط على أزرار التحقق من الاشتراك
                 first_name = call.from_user.first_name if call.from_user and call.from_user.first_name else "المهندس"
                 welcome_text = (
                    f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"   
                 f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
                 )
                 bot.send_message(call.message.chat.id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
