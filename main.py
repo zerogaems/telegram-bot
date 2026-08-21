@@ -560,7 +560,7 @@ def handle_all_messages(message):
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
             welcome_text = (
-                f"👋 **أهلاً بك يا مهندسنا العظيم  {message.from_user.first_name}!**\n\n"
+                f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                 f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
