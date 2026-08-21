@@ -640,7 +640,6 @@ def handle_all_messages(message):
                     bot.send_message(
                         chat_id, 
                         f"⏳ **المحاضرة لم تُعطَ بعد**\n\n"
-                        f"📖 لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.\n"
                         f"🔔 سيتم إدراجها فور صدورها رسمياً.", 
                         parse_mode="Markdown"
                     )
@@ -657,7 +656,15 @@ def callback_handler(call):
                 bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
                 bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
                 user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
-                bot.send_message(call.message.chat.id, "شرفتنا", reply_markup=get_years_keyboard())
+                bot.send_message(call.message.chat.id, "   f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
+                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
+                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                f"👇 **يرجى اختيار السنة الدراسية للبدء:** ",
+                                 
+               
+                                 
+                                 reply_markup=get_years_keyboard())
             else:
                 bot.answer_callback_query(call.id, "❌ أنت غير مشترك في القناة بعد!", show_alert=True)
     except Exception as e:
