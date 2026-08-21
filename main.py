@@ -631,15 +631,19 @@ def handle_all_messages(message):
                     )
                     return
 
-            c_mat = user_states.get(chat_id, {}).get("material")
+    c_mat = user_states.get(chat_id, {}).get("material")
             if c_mat:
                 file_id = get_file_from_db(db_key, c_mat, text)
                 if file_id:
                     bot.send_document(chat_id, file_id, caption=f"📄 {text} - مادة {c_mat}")
                 else:
-                    bot.send_message(chat_id, f"⚠️ لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.")
+                    bot.send_message(
+                        chat_id, 
+                        f"⏳ المحاضرة لم تُعطَ بعد.\n\nلم يتم رفع ملف [{text}] لمادة [{c_mat}]، وسيتم إضافته فور صدوره رسمياً.", 
+                        parse_mode="Markdown"
+                    )
                 return
-
+           
     except Exception as e:
         print(f"حدث خطأ: {e}")
 
