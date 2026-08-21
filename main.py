@@ -16,6 +16,10 @@ CHANNEL_USERNAME = "@Hamak456"
 ADMIN_ID = 7547218555
 
 bot = telebot.TeleBot(TOKEN)
+# ضبط قائمة الأوامر التي تظهر بجانب صندوق الكتابة
+bot.set_my_commands([
+    telebot.types.BotCommand("start", "إعادة تشغيل")
+])
 user_states = {}
 last_interaction_time = {}
 admin_broadcast_state = {}
