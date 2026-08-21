@@ -1,15 +1,26 @@
-from ctypes import pythonapi
-pythonapi
 import os
+import time
+import sqlite3
 from threading import Thread
 from flask import Flask
-import time
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-last_interaction_time = {}
+# ==========================================
+# 1. إعدادات البوت وقاعدة البيانات
+# ==========================================
 
-# سيرفر خفيف لإبقاء الخدمة نشطة في Render
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', "8784917944:AAGD5Ry6zPQJwscA0PD-V4vttp5afwYdTss")
+CHANNEL_USERNAME = "@Hamak456"
+ADMIN_ID = 7547218555
+
+bot = telebot.TeleBot(TOKEN)
+user_states = {}
+last_interaction_time = {}
+admin_broadcast_state = {}
+admin_add_file_state = {}
+
+# سيرفر لإبقاء الخدمة نشطة في Render
 app = Flask('')
 
 @app.route('/')
@@ -20,41 +31,83 @@ def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
-# تشغيل السيرفر في مسار خلفي
-Thread(target=run_web).start()
+Thread(target=run_web, daemon=True).start()
+
+# --- إدارة قاعدة البيانات SQLite ---
+
+def init_db():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    # جدول المستخدمين
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # جدول المحاضرات والملفات
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS materials_content (
+            db_key TEXT,
+            material_name TEXT,
+            lecture_name TEXT,
+            file_id TEXT,
+            PRIMARY KEY (db_key, material_name, lecture_name)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def add_user(user_id, first_name):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, first_name) VALUES (?, ?)', (user_id, first_name))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    users = cursor.fetchall()
+    conn.close()
+    return [user[0] for user in users]
+
+def get_users_count():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM users')
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+def save_file_to_db(db_key, material_name, lecture_name, file_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO materials_content (db_key, material_name, lecture_name, file_id)
+        VALUES (?, ?, ?, ?)
+    ''', (db_key, material_name, lecture_name, file_id))
+    conn.commit()
+    conn.close()
+
+def get_file_from_db(db_key, material_name, lecture_name):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT file_id FROM materials_content 
+        WHERE db_key = ? AND material_name = ? AND lecture_name = ?
+    ''', (db_key, material_name, lecture_name))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+init_db()
 
 # ==========================================
-# إعدادات البوت والبيانات
+# 2. الهيكل التأسيسي للمواد والدراسة
 # ==========================================
-
-TOKEN = "8784917944:AAGD5Ry6zPQJwscA0PD-V4vttp5afwYdTss"
-CHANNEL_USERNAME = "@Hamak456"  # معرف القناة
-ADMIN_ID = 7547218555
-
-bot = telebot.TeleBot(TOKEN)
-user_states = {}
-
-# دالة استقبال الملفات من الأدمن للحصول على File ID
-@bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice'])
-def send_file_id(message):
-    if message.from_user.id == ADMIN_ID:
-        file_id = None
-        if message.document:
-            file_id = message.document.file_id
-        elif message.photo:
-            file_id = message.photo[-1].file_id
-        elif message.video:
-            file_id = message.video.file_id
-        elif message.audio:
-            file_id = message.audio.file_id
-        elif message.voice:
-            file_id = message.voice.file_id
-
-        if file_id:
-            bot.reply_to(message, f"🔑 **File ID الخاص بالأدمن:**\n\n`{file_id}`", parse_mode="Markdown")
-    else:
-        bot.reply_to(message, "عذراً، هذه الميزة مخصصة لإدارة البوت فقط.")
-
 
 database = {  
     # ------------ السنة الأولى ------------
@@ -121,7 +174,9 @@ database = {
     ]
 }
 
-# --- لوحات المفاتيح (Keyboards) ---
+# ==========================================
+# 3. لوحات المفاتيح (Keyboards)
+# ==========================================
 
 def get_years_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -149,10 +204,10 @@ def get_materials_keyboard(materials_list):
     markup.row("🔙 رجوع للفصول", "🏠 العودة للرئيسية")
     return markup
 
-def get_content_keyboard(content_dict):
+def get_content_keyboard(content_list):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     row = []
-    for key in content_dict.keys():
+    for key in content_list:
         if key == "📝 دورات سابقة":
             continue
         row.append(KeyboardButton(key))
@@ -162,15 +217,22 @@ def get_content_keyboard(content_dict):
     if row:
         markup.row(*row)
     
-    if "📝 دورات سابقة" in content_dict:
+    if "📝 دورات سابقة" in content_list:
         markup.row("📝 دورات سابقة")
         
     markup.row("🔙 رجوع للمواد", "🏠 العودة للرئيسية")
     return markup
 
+def get_admin_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📊 إحصائيات البوت", "📢 إرسال إذاعة")
+    markup.row("➕ تحديث File ID لمادة", "🏠 العودة للرئيسية")
+    return markup
+
 def get_sub_inline_markup():
     markup = InlineKeyboardMarkup()
-    channel_url = f"[https://t.me/](https://t.me/){CHANNEL_USERNAME.replace('@', '')}"
+    clean_username = CHANNEL_USERNAME.replace('@', '')
+    channel_url = f"https://t.me/{clean_username}"
     markup.add(InlineKeyboardButton("📢 رابط القناة", url=channel_url))
     markup.add(InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription"))
     return markup
@@ -182,69 +244,128 @@ def check_sub(user_id):
     except Exception:
         return False
 
-# --- معالجة الرسائل ---
+# ==========================================
+# 4. معالجة الرسائل والملفات
+# ==========================================
+
+# استقبال أي ملف من الأدمن للحصول على الـ File ID التلقائي
+@bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice'])
+def handle_admin_files(message):
+    user_id = message.from_user.id
+    if user_id == ADMIN_ID:
+        file_id = None
+        if message.document: file_id = message.document.file_id
+        elif message.photo: file_id = message.photo[-1].file_id
+        elif message.video: file_id = message.video.file_id
+        elif message.audio: file_id = message.audio.file_id
+        elif message.voice: file_id = message.voice.file_id
+
+        if admin_add_file_state.get(user_id):
+            # إذا كان الأدمن في خطوة حفظ الملف لمادة معينة
+            state = admin_add_file_state[user_id]
+            save_file_to_db(state['db_key'], state['material'], state['lecture'], file_id)
+            bot.reply_to(message, f"✅ تم حفظ الملف بنجاح للمادة [{state['material']}] - [{state['lecture']}]!")
+            admin_add_file_state[user_id] = None
+        else:
+            bot.reply_to(message, f"🔑 **File ID الخاص بالملف:**\n\n`{file_id}`", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     text = message.text
+    
+    # حفظ المستخدم في قاعدة البيانات تلقائياً
+    add_user(user_id, message.from_user.first_name)
+
     current_time = time.time()
-
-    # حماية ضد التكرار والسبام
-    if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.5:
-        try:
-            bot.reply_to(message, "رووووق ✋ ليش مستعجل رجاع اطلب الطلب بهداوة !")
-        except Exception:
-            pass
+    if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.0:
         return
-
     last_interaction_time[user_id] = current_time
 
-    # حماية الكود من الانهيار عند حدوث أي خطأ
     try:
-        # التحقق من الاشتراك في القناة
-        if not check_sub(user_id):
+        # ---- أجهزة وتنبيهات الأدمن ----
+        if user_id == ADMIN_ID:
+            if text == "/admin":
+                bot.send_message(chat_id, "🔧 **لوحة تحكم الأدمن:**", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+                return
+
+            if text == "📊 إحصائيات البوت":
+                count = get_users_count()
+                bot.send_message(chat_id, f"📈 **عدد مستخدمي البوت:** `{count}` مستخدم", parse_mode="Markdown")
+                return
+
+            if text == "📢 إرسال إذاعة":
+                admin_broadcast_state[user_id] = True
+                bot.send_message(chat_id, "أرسل نص الرسالة التي تريد إرسالها للجميع:")
+                return
+
+            if admin_broadcast_state.get(user_id):
+                admin_broadcast_state[user_id] = False
+                users = get_all_users()
+                success, failed = 0, 0
+                bot.send_message(chat_id, f"⏳ جاري الإرسال إلى {len(users)} مستخدم...")
+                for u_id in users:
+                    try:
+                        bot.send_message(u_id, text)
+                        success += 1
+                        time.sleep(0.05)
+                    except Exception:
+                        failed += 1
+                bot.send_message(chat_id, f"✅ اكتملت الإذاعة!\n• نجاح: {success}\n• فشل: {failed}")
+                return
+
+            if text == "➕ تحديث File ID لمادة":
+                c_year = user_states.get(chat_id, {}).get("year")
+                c_sem = user_states.get(chat_id, {}).get("sem")
+                c_mat = user_states.get(chat_id, {}).get("material")
+                if c_year and c_sem and c_mat:
+                    bot.send_message(chat_id, f"أرسل اسم المحاضرة/الدورة التي تريد رفع ملف لها (مثال: محاضرة 1 📄):")
+                    admin_add_file_state[user_id] = {"step": "WAIT_LECTURE", "db_key": f"year_{c_year}_sem_{c_sem}", "material": c_mat}
+                else:
+                    bot.send_message(chat_id, "⚠️ يرجى التوجه للمادة والمحاضرة المطلوبة عبر الأزرار أولاً ثم الضغط على هذا الزر.")
+                return
+
+            if admin_add_file_state.get(user_id) and admin_add_file_state[user_id].get("step") == "WAIT_LECTURE":
+                admin_add_file_state[user_id]["lecture"] = text
+                admin_add_file_state[user_id]["step"] = "WAIT_FILE"
+                bot.send_message(chat_id, f"قم برفع/إرسال الملف الان ليتم ربطه بـ [{text}]:")
+                return
+
+        # ---- التحقق من الاشتراك بالضرورة للمستخدمين ----
+        if user_id != ADMIN_ID and not check_sub(user_id):
             bot.send_message(
                 chat_id,
-                f"⚠️ عذراً عزيزي، يجب عليك الاشتراك في القناة أولاً لاستخدام البوت:\n{CHANNEL_USERNAME}",
+                f"⚠️ يجب عليك الاشتراك في القناة أولاً لاستخدام البوت:\n{CHANNEL_USERNAME}",
                 reply_markup=get_sub_inline_markup()
             )
             return
 
-        # القائمة الرئيسية / Start
+        # ---- التنقل الرئيسي ----
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
             bot.send_message(chat_id, "أهلاً بالمهندس العظيم! اختر السنة الدراسية:", reply_markup=get_years_keyboard())
             return
 
-        # اختيار السنة
-        years_map = {
-            "السنة الأولى 1️⃣": 1, "السنة الثانية 2️⃣": 2,
-            "السنة الثالثة 3️⃣": 3, "السنة الرابعة 4️⃣": 4, "السنة الخامسة 5️⃣": 5
-        }
+        years_map = {"السنة الأولى 1️⃣": 1, "السنة الثانية 2️⃣": 2, "السنة الثالثة 3️⃣": 3, "السنة الرابعة 4️⃣": 4, "السنة الخامسة 5️⃣": 5}
         if text in years_map:
             user_states[chat_id] = {"year": years_map[text], "sem": None, "material": None}
             bot.send_message(chat_id, f"اختر الفصل الدراسي لـ {text}:", reply_markup=get_semesters_keyboard())
             return
 
-        # اختيار الفصل
         sems_map = {"الفصل الأول 📘": 1, "الفصل الثاني 📙": 2}
         if text in sems_map:
             c_year = user_states.get(chat_id, {}).get("year")
             if not c_year:
-                bot.send_message(chat_id, "يرجى اختيار السنة الدراسية أولاً:", reply_markup=get_years_keyboard())
+                bot.send_message(chat_id, "اختر السنة الدراسية أولاً:", reply_markup=get_years_keyboard())
                 return
-            
             user_states[chat_id]["sem"] = sems_map[text]
             user_states[chat_id]["material"] = None
             db_key = f"year_{c_year}_sem_{sems_map[text]}"
             materials = database.get(db_key, [])
-            
             bot.send_message(chat_id, f"إليك مواد السنة {c_year} - الفصل {sems_map[text]}:", reply_markup=get_materials_keyboard(materials))
             return
 
-        # زر الرجوع للفصول
         if text == "🔙 رجوع للفصول":
             c_year = user_states.get(chat_id, {}).get("year")
             if c_year:
@@ -254,7 +375,6 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, "اختر السنة الدراسية:", reply_markup=get_years_keyboard())
             return
 
-        # زر الرجوع للمواد
         if text == "🔙 رجوع للمواد":
             c_year = user_states.get(chat_id, {}).get("year")
             c_sem = user_states.get(chat_id, {}).get("sem")
@@ -266,15 +386,13 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, "اختر السنة الدراسية:", reply_markup=get_years_keyboard())
             return
 
-        # اختيار المادة والمحاضرة
+        # ---- إرسال واسترجاع الملفات للمواد ----
         c_year = user_states.get(chat_id, {}).get("year")
         c_sem = user_states.get(chat_id, {}).get("sem")
-        
         if c_year and c_sem:
             db_key = f"year_{c_year}_sem_{c_sem}"
             materials = database.get(db_key, [])
             
-            # التحقق إذا كانت الرسالة اسماً لمادة
             for mat in materials:
                 if mat["name"] == text:
                     user_states[chat_id]["material"] = text
@@ -285,33 +403,33 @@ def handle_all_messages(message):
                     )
                     return
 
-            # التحقق إذا كانت الرسالة اسماً لمحاضرة
             c_mat = user_states.get(chat_id, {}).get("material")
             if c_mat:
-                for mat in materials:
-                    if mat["name"] == c_mat:
-                        if text in mat["content"]:
-                            file_id = mat["content"][text]
-                            if file_id == "PASTE_FILE_ID_HERE":
-                                bot.send_message(chat_id, f"⚠️ لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.")
-                            else:
-                                bot.send_document(chat_id, file_id, caption=f"📄 {text} - مادة {c_mat}")
-                            return
+                file_id = get_file_from_db(db_key, c_mat, text)
+                if file_id:
+                    bot.send_document(chat_id, file_id, caption=f"📄 {text} - مادة {c_mat}")
+                else:
+                    bot.send_message(chat_id, f"⚠️ لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.")
+                return
 
     except Exception as e:
-        print(f"حدث خطأ مع المستخدم {user_id}: {e}")
+        print(f"حدث خطأ: {e}")
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    bot.answer_callback_query(call.id)
-    if call.data == "check_subscription":
-        if check_sub(call.from_user.id):
-            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-            user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
-            bot.send_message(call.message.chat.id, "أهلاً بالمهندس العظيم! اختر السنة الدراسية:", reply_markup=get_years_keyboard())
-        else:
-            bot.answer_callback_query(call.id, "❌ أنت غير مشترك في القناة بعد!", show_alert=True)
+    try:
+        if call.data == "check_subscription":
+            if check_sub(call.from_user.id):
+                bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
+                bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+                user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
+                bot.send_message(call.message.chat.id, "أهلاً بالمهندس العظيم! اختر السنة الدراسية:", reply_markup=get_years_keyboard())
+            else:
+                bot.answer_callback_query(call.id, "❌ أنت غير مشترك في القناة بعد!", show_alert=True)
+    except Exception as e:
+        print(f"Callback Error: {e}")
 
-print("البوت يعمل بنجاح!")
-bot.infinity_polling()
+if __name__ == "__main__":
+    print("البوت يعمل بنجاح...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
