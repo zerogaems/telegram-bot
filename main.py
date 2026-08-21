@@ -17,10 +17,13 @@ ADMIN_ID = 7547218555
 
 bot = telebot.TeleBot(TOKEN)
 
-# ضبط قائمة الأوامر (تظهر زر القائمة Menu بجانب صندوق الكتابة)
-bot.set_my_commands([
-    telebot.types.BotCommand("start", "إعادة تشغيل البوت")
-])
+# ضبط قائمة الأوامر (Menu)
+try:
+    bot.set_my_commands([
+        telebot.types.BotCommand("start", "إعادة تشغيل البوت")
+    ])
+except Exception as e:
+    print(f"Set commands error: {e}")
 
 user_states = {}
 last_interaction_time = {}
@@ -305,8 +308,9 @@ def get_sub_inline_markup():
 def check_sub(user_id):
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ['creator', 'administrator', 'member']
-    except Exception:
+        return member.status in ['creator', 'administrator', 'member', 'restricted']
+    except Exception as e:
+        print(f"Check Sub Exception: {e}")
         return False
 
 # ==========================================
@@ -335,7 +339,7 @@ def handle_admin_media(message):
             admin_exam_schedule_state[user_id] = False
             return
 
-        if admin_add_file_state.get(user_id):
+        if admin_add_file_state.get(user_id) and admin_add_file_state[user_id].get("step") == "WAIT_FILE":
             state = admin_add_file_state[user_id]
             save_file_to_db(state['db_key'], state['material'], state['lecture'], file_id)
             bot.reply_to(message, f"✅ تم حفظ/تحديث الملف بنجاح للمادة [{state['material']}] - [{state['lecture']}]!")
@@ -349,16 +353,17 @@ def handle_admin_media(message):
 def handle_all_messages(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
-    text = message.text
+    text = message.text if message.text else ""
     
     if is_user_banned(user_id) and user_id != ADMIN_ID:
         bot.send_message(chat_id, "🚫 تم حظرك من استخدام هذا البوت بسبب مخالفة القوانين.")
         return
 
-    add_user(user_id, message.from_user.first_name)
+    first_name = message.from_user.first_name if message.from_user and message.from_user.first_name else "المهندس"
+    add_user(user_id, first_name)
 
     current_time = time.time()
-    if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 1.0:
+    if user_id in last_interaction_time and current_time - last_interaction_time[user_id] < 0.5:
         return
     last_interaction_time[user_id] = current_time
 
@@ -480,7 +485,7 @@ def handle_all_messages(message):
             except Exception as e:
                 print(f"خطأ في الرد: {e}")
 
-        # ---- فحص الاشتراك ----
+        # ---- فحص الاشتراك للمستخدمين العاديين ----
         if user_id != ADMIN_ID and not check_sub(user_id):
             bot.send_message(
                 chat_id,
@@ -511,7 +516,7 @@ def handle_all_messages(message):
             user_feedback_state[user_id] = False
             bot.send_message(
                 ADMIN_ID, 
-                f"📩 **رسالة/ملاحظة جديدة:**\n\nمن: {message.from_user.first_name}\n(ID: `{user_id}`)\n\nالرسالة:\n{text}\n\n*(للرد على هذا الطالب، قم بعمل Reply على هذه الرسالة واكتب ردك)*", 
+                f"📩 **رسالة/ملاحظة جديدة:**\n\nمن: {first_name}\n(ID: `{user_id}`)\n\nالرسالة:\n{text}\n\n*(للرد على هذا الطالب، قم بعمل Reply على هذه الرسالة واكتب ردك)*", 
                 parse_mode="Markdown"
             )
             bot.send_message(chat_id, "✅ تم إرسال ملاحظتك بنجاح للإدارة، شكراً لك!")
@@ -520,12 +525,10 @@ def handle_all_messages(message):
         # ---- التنقل الرئيسي ----
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
-            first_name = message.from_user.first_name if message.from_user and message.from_user.first_name else "المهندس"
             welcome_text = (
-                f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
-                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                f"👋 **أهلاً بك يا مهندس {first_name}!**\n\n"
+                f"🎓 مرحباً بك في البوت الأكاديمي المساعد.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                 f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
                 f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
             )
             bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
@@ -611,32 +614,38 @@ def handle_all_messages(message):
     except Exception as e:
         print(f"حدث خطأ: {e}")
 
+# ==========================================
+# 5. معالجة الضغط على أزرار Inline (التحقق من الاشتراك)
+# ==========================================
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     try:
+        chat_id = call.message.chat.id
+        user_id = call.from_user.id
+        
         if call.data == "check_subscription":
-            if check_sub(call.from_user.id):
+            if check_sub(user_id):
                 bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك بنجاح!")
                 
-                # إخفاء/حذف رسالة الاشتراك بشكل آمن بدون إيقاف الكود عند الفشل
+                # حذف رسالة الاشتراك السابقة بأمان
                 try:
-                    bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+                    bot.delete_message(chat_id=chat_id, message_id=call.message.message_id)
                 except Exception:
                     pass
 
-                user_states[call.message.chat.id] = {"year": None, "sem": None, "material": None}
+                user_states[chat_id] = {"year": None, "sem": None, "material": None}
                 
                 first_name = call.from_user.first_name if call.from_user and call.from_user.first_name else "المهندس"
                 welcome_text = (
-                   f"👋 ** أهلاً بك يا  {message.from_user.first_name}!**\n\n"
-                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"   
-                f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
+                    f"👋 **أهلاً بك يا مهندس {first_name}!**\n\n"
+                    f"🎓 مرحباً بك في البوت الأكاديمي المساعد.\n"
+                    f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                    f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
                 )
-                bot.send_message(call.message.chat.id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
+                bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
             else:
-                bot.answer_callback_query(call.id, "❌ أنت غير مشترك في القناة بعد!", show_alert=True)
+                bot.answer_callback_query(call.id, "❌ لم يتم العثور على اشتراكك بالقناة، اشترك ثم اضغط مجدداً!", show_alert=True)
     except Exception as e:
         print(f"Callback Error: {e}")
 
