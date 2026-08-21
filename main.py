@@ -1,6 +1,7 @@
 import os
 import time
 import sqlite3
+from datetime import datetime
 from threading import Thread
 from flask import Flask
 import telebot
@@ -19,8 +20,12 @@ user_states = {}
 last_interaction_time = {}
 admin_broadcast_state = {}
 admin_add_file_state = {}
+admin_delete_file_state = {}
+admin_post_announcement_state = {}
+admin_exam_schedule_state = {}
+admin_ban_state = {}
+user_feedback_state = {}
 
-# سيرفر لإبقاء الخدمة نشطة في Render
 app = Flask('')
 
 @app.route('/')
@@ -38,7 +43,6 @@ Thread(target=run_web, daemon=True).start()
 def init_db():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    # جدول المستخدمين
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -46,7 +50,6 @@ def init_db():
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # جدول المحاضرات والملفات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS materials_content (
             db_key TEXT,
@@ -54,6 +57,29 @@ def init_db():
             lecture_name TEXT,
             file_id TEXT,
             PRIMARY KEY (db_key, material_name, lecture_name)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_type TEXT,
+            text_content TEXT,
+            file_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # جدول حظر المستخدمين
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # جدول برنامج الامتحانات (صورة)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     ''')
     conn.commit()
@@ -92,6 +118,18 @@ def save_file_to_db(db_key, material_name, lecture_name, file_id):
     conn.commit()
     conn.close()
 
+def delete_file_from_db(db_key, material_name, lecture_name):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        DELETE FROM materials_content 
+        WHERE db_key = ? AND material_name = ? AND lecture_name = ?
+    ''', (db_key, material_name, lecture_name))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
 def get_file_from_db(db_key, material_name, lecture_name):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
@@ -103,10 +141,99 @@ def get_file_from_db(db_key, material_name, lecture_name):
     conn.close()
     return result[0] if result else None
 
+def search_files_in_db(query):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT material_name, lecture_name, file_id FROM materials_content 
+        WHERE material_name LIKE ? OR lecture_name LIKE ?
+    ''', (f'%{query}%', f'%{query}%'))
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+def save_announcement(content_type, text_content, file_id=None):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM announcements')
+    cursor.execute('''
+        INSERT INTO announcements (content_type, text_content, file_id)
+        VALUES (?, ?, ?)
+    ''', (content_type, text_content, file_id))
+    conn.commit()
+    conn.close()
+
+def get_latest_announcement():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT content_type, text_content, file_id FROM announcements ORDER BY id DESC LIMIT 1')
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+# حفظ واسترجاع File ID برنامج الامتحانات
+def save_exam_schedule(file_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("exam_schedule_photo", ?)', (file_id,))
+    conn.commit()
+    conn.close()
+
+def get_exam_schedule():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT value FROM settings WHERE key = "exam_schedule_photo"')
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+# إدارة الحظر
+def ban_user(user_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    conn.close()
+
+def unban_user(user_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+def is_user_banned(user_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
 init_db()
 
+# خيط النسخ الاحتياطي التلقائي الأسبوعي
+def auto_backup_thread():
+    while True:
+        try:
+            time.sleep(7 * 24 * 3600)  # كل 7 أيام
+            if os.path.exists('bot_database.db'):
+                with open('bot_database.db', 'rb') as doc:
+                    bot.send_document(
+                        ADMIN_ID, 
+                        doc, 
+                        caption=f"📦 **نسخة احتياطية تلقائية أسبوعية لقاعدة البيانات**\n📅 التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
+                        parse_mode="Markdown"
+                    )
+        except Exception as e:
+            print(f"Auto Backup Error: {e}")
+
+Thread(target=auto_backup_thread, daemon=True).start()
+
 # ==========================================
-# 2. الهيكل التأسيسي للمواد والدراسة
+# 2. الهيكل التأسيسي للمواد
 # ==========================================
 
 database = {  
@@ -182,7 +309,9 @@ def get_years_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("السنة الأولى 1️⃣", "السنة الثانية 2️⃣")
     markup.row("السنة الثالثة 3️⃣", "السنة الرابعة 4️⃣")
-    markup.row("السنة الخامسة 5️⃣")
+    markup.row("السنة الخامسة 5️⃣", "📅 برنامج الامتحان")
+    markup.row("🔍 بحث عن محاضرة", "📌 الإعلانات والبرنامج")
+    markup.row("💬 أرسل ملاحظة/استفسار")
     return markup
 
 def get_semesters_keyboard():
@@ -226,7 +355,10 @@ def get_content_keyboard(content_list):
 def get_admin_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("📊 إحصائيات البوت", "📢 إرسال إذاعة")
-    markup.row("➕ تحديث File ID لمادة", "🏠 العودة للرئيسية")
+    markup.row("➕ تحديث File ID لمادة", "🗑️ حذف ملف مادة")
+    markup.row("📸 رفع صورة برنامج الامتحان", "📌 نشر إعلان عام")
+    markup.row("📦 نسخة احتياطية فورية", "🚫 حظر / إلغاء حظر مستخدم")
+    markup.row("🏠 العودة للرئيسية")
     return markup
 
 def get_sub_inline_markup():
@@ -248,26 +380,49 @@ def check_sub(user_id):
 # 4. معالجة الرسائل والملفات
 # ==========================================
 
-# استقبال أي ملف من الأدمن للحصول على الـ File ID التلقائي
 @bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice'])
-def handle_admin_files(message):
+def handle_admin_media(message):
     user_id = message.from_user.id
     if user_id == ADMIN_ID:
         file_id = None
-        if message.document: file_id = message.document.file_id
-        elif message.photo: file_id = message.photo[-1].file_id
-        elif message.video: file_id = message.video.file_id
-        elif message.audio: file_id = message.audio.file_id
-        elif message.voice: file_id = message.voice.file_id
+        content_type = 'text'
+        
+        if message.document:
+            file_id = message.document.file_id
+            content_type = 'document'
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+            content_type = 'photo'
+        elif message.video:
+            file_id = message.video.file_id
+            content_type = 'video'
+
+        # رفع صورة برنامج الامتحان
+        if admin_exam_schedule_state.get(user_id):
+            if file_id:
+                save_exam_schedule(file_id)
+                bot.reply_to(message, "✅ تم حفظ صورة برنامج الامتحان بنجاح!")
+            else:
+                bot.reply_to(message, "❌ يرجى إرسال صورة أو ملف فقط.")
+            admin_exam_schedule_state[user_id] = False
+            return
 
         if admin_add_file_state.get(user_id):
-            # إذا كان الأدمن في خطوة حفظ الملف لمادة معينة
             state = admin_add_file_state[user_id]
             save_file_to_db(state['db_key'], state['material'], state['lecture'], file_id)
-            bot.reply_to(message, f"✅ تم حفظ الملف بنجاح للمادة [{state['material']}] - [{state['lecture']}]!")
+            bot.reply_to(message, f"✅ تم حفظ/تحديث الملف بنجاح للمادة [{state['material']}] - [{state['lecture']}]!")
             admin_add_file_state[user_id] = None
-        else:
-            bot.reply_to(message, f"🔑 **File ID الخاص بالملف:**\n\n`{file_id}`", parse_mode="Markdown")
+            return
+
+        if admin_post_announcement_state.get(user_id):
+            caption = message.caption if message.caption else "📌 إعلان جديد من إدارة الكلية:"
+            save_announcement(content_type, caption, file_id)
+            bot.reply_to(message, "✅ تم نشر الإعلان بنجاح!")
+            admin_post_announcement_state[user_id] = False
+            return
+
+        if file_id:
+            bot.reply_to(message, f"🔑 **File ID الخاص بالمستند:**\n\n`{file_id}`", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
@@ -275,7 +430,11 @@ def handle_all_messages(message):
     chat_id = message.chat.id
     text = message.text
     
-    # حفظ المستخدم في قاعدة البيانات تلقائياً
+    # فحص الحظر
+    if is_user_banned(user_id) and user_id != ADMIN_ID:
+        bot.send_message(chat_id, "🚫 تم حظرك من استخدام هذا البوت بسبب مخالفة القوانين.")
+        return
+
     add_user(user_id, message.from_user.first_name)
 
     current_time = time.time()
@@ -293,6 +452,12 @@ def handle_all_messages(message):
             if text == "📊 إحصائيات البوت":
                 count = get_users_count()
                 bot.send_message(chat_id, f"📈 **عدد مستخدمي البوت:** `{count}` مستخدم", parse_mode="Markdown")
+                return
+
+            if text == "📦 نسخة احتياطية فورية":
+                if os.path.exists('bot_database.db'):
+                    with open('bot_database.db', 'rb') as doc:
+                        bot.send_document(chat_id, doc, caption="📦 **نسخة احتياطية فورية لقاعدة البيانات**")
                 return
 
             if text == "📢 إرسال إذاعة":
@@ -315,12 +480,23 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, f"✅ اكتملت الإذاعة!\n• نجاح: {success}\n• فشل: {failed}")
                 return
 
+            if text == "📸 رفع صورة برنامج الامتحان":
+                admin_exam_schedule_state[user_id] = True
+                bot.send_message(chat_id, "أرسل الآن صورة برنامج الامتحان أو قم بإرسال الـ File ID الخاص بالصورة كرسالة نصية:")
+                return
+
+            if admin_exam_schedule_state.get(user_id):
+                admin_exam_schedule_state[user_id] = False
+                save_exam_schedule(text.strip())
+                bot.send_message(chat_id, f"✅ تم حفظ File ID لبرنامج الامتحان بنجاح:\n`{text.strip()}`", parse_mode="Markdown")
+                return
+
             if text == "➕ تحديث File ID لمادة":
                 c_year = user_states.get(chat_id, {}).get("year")
                 c_sem = user_states.get(chat_id, {}).get("sem")
                 c_mat = user_states.get(chat_id, {}).get("material")
                 if c_year and c_sem and c_mat:
-                    bot.send_message(chat_id, f"أرسل اسم المحاضرة/الدورة التي تريد رفع ملف لها (مثال: محاضرة 1 📄):")
+                    bot.send_message(chat_id, f"أرسل اسم المحاضرة/الدورة التي تريد رفع أو استبدال ملف لها (مثال: محاضرة 1 📄):")
                     admin_add_file_state[user_id] = {"step": "WAIT_LECTURE", "db_key": f"year_{c_year}_sem_{c_sem}", "material": c_mat}
                 else:
                     bot.send_message(chat_id, "⚠️ يرجى التوجه للمادة والمحاضرة المطلوبة عبر الأزرار أولاً ثم الضغط على هذا الزر.")
@@ -329,16 +505,140 @@ def handle_all_messages(message):
             if admin_add_file_state.get(user_id) and admin_add_file_state[user_id].get("step") == "WAIT_LECTURE":
                 admin_add_file_state[user_id]["lecture"] = text
                 admin_add_file_state[user_id]["step"] = "WAIT_FILE"
-                bot.send_message(chat_id, f"قم برفع/إرسال الملف الان ليتم ربطه بـ [{text}]:")
+                bot.send_message(chat_id, f"قم برفع/إرسال الملف الآن ليتم ربطه أو استبداله بـ [{text}]:")
                 return
 
-        # ---- التحقق من الاشتراك بالضرورة للمستخدمين ----
+            if text == "🗑️ حذف ملف مادة":
+                c_year = user_states.get(chat_id, {}).get("year")
+                c_sem = user_states.get(chat_id, {}).get("sem")
+                c_mat = user_states.get(chat_id, {}).get("material")
+                if c_year and c_sem and c_mat:
+                    bot.send_message(chat_id, f"أرسل اسم المحاضرة التي تريد حذفها نهائياً من مادة [{c_mat}] (مثال: محاضرة 1 📄):")
+                    admin_delete_file_state[user_id] = {"step": "WAIT_LECTURE", "db_key": f"year_{c_year}_sem_{c_sem}", "material": c_mat}
+                else:
+                    bot.send_message(chat_id, "⚠️ يرجى التوجه للمادة المطلوبة عبر الأزرار أولاً ثم الضغط على هذا الزر.")
+                return
+
+            if admin_delete_file_state.get(user_id) and admin_delete_file_state[user_id].get("step") == "WAIT_LECTURE":
+                state = admin_delete_file_state[user_id]
+                success = delete_file_from_db(state['db_key'], state['material'], text)
+                if success:
+                    bot.send_message(chat_id, f"✅ تم حذف ملف [{text}] من المادة [{state['material']}] بنجاح!")
+                else:
+                    bot.send_message(chat_id, f"❌ لم يتم العثور على ملف باسم [{text}] لهذه المادة.")
+                admin_delete_file_state[user_id] = None
+                return
+
+            if text == "📌 نشر إعلان عام":
+                admin_post_announcement_state[user_id] = True
+                bot.send_message(chat_id, "أرسل نص الإعلان أو قم برفع الملف الخاص بالإعلان الآن:")
+                return
+
+            if admin_post_announcement_state.get(user_id):
+                save_announcement('text', text, None)
+                bot.send_message(chat_id, "✅ تم نشر الإعلان النصي بنجاح!")
+                admin_post_announcement_state[user_id] = False
+                return
+
+            if text == "🚫 حظر / إلغاء حظر مستخدم":
+                admin_ban_state[user_id] = True
+                bot.send_message(chat_id, "أدخل الـ User ID الخاص بالطالب للحظر/إلغاء الحظر:")
+                return
+
+            if admin_ban_state.get(user_id):
+                admin_ban_state[user_id] = False
+                try:
+                    target_id = int(text.strip())
+                    if is_user_banned(target_id):
+                        unban_user(target_id)
+                        bot.send_message(chat_id, f"✅ تم إلغاء حظر المستخدم `{target_id}` بنجاح!", parse_mode="Markdown")
+                    else:
+                        ban_user(target_id)
+                        bot.send_message(chat_id, f"🚫 تم حظر المستخدم `{target_id}` بنجاح!", parse_mode="Markdown")
+                except ValueError:
+                    bot.send_message(chat_id, "❌ خطأ: يرجى إدخال رقم User ID صحيح.")
+                return
+
+        # ---- الرد على مقترحات الطلاب مباشرة من قبل الأدمن ----
+        if message.reply_to_message and user_id == ADMIN_ID:
+            try:
+                orig_text = message.reply_to_message.text
+                if "ID:" in orig_text:
+                    target_user_id = int(orig_text.split("ID:")[1].split(")")[0].strip())
+                    bot.send_message(target_user_id, f"📬 **رد من إدارة البوت:**\n\n{text}", parse_mode="Markdown")
+                    bot.send_message(chat_id, "✅ تم إرسال الرد للطالب بنجاح!")
+                    return
+            except Exception as e:
+                print(f"خطأ في الرد: {e}")
+
+        # ---- التحقق من الاشتراك للمستخدمين ----
         if user_id != ADMIN_ID and not check_sub(user_id):
             bot.send_message(
                 chat_id,
                 f"⚠️ يجب عليك الاشتراك في القناة أولاً لاستخدام البوت:\n{CHANNEL_USERNAME}",
                 reply_markup=get_sub_inline_markup()
             )
+            return
+
+        # ---- عرض صورة برنامج الامتحان ----
+        if text == "📅 برنامج الامتحان":
+            file_id = get_exam_schedule()
+            if file_id:
+                try:
+                    bot.send_photo(chat_id, file_id, caption="📅 **برنامج الامتحانات الرسمية:**")
+                except Exception:
+                    # في حال تم الرفع كمستند وليس صورة
+                    bot.send_document(chat_id, file_id, caption="📅 **برنامج الامتحانات الرسمية:**")
+            else:
+                bot.send_message(chat_id, "ℹ️ لم يتم رفع صورة برنامج الامتحان بعد من قبل إدارة الكلية.")
+            return
+
+        # ---- استقبال الملاحظات والاستفسارات من الطلاب ----
+        if text == "💬 أرسل ملاحظة/استفسار":
+            user_feedback_state[user_id] = True
+            bot.send_message(chat_id, "اكتب استفسارك أو ملاحظتك الآن وسوف تصل لإدارة البوت فوراً:")
+            return
+
+        if user_feedback_state.get(user_id):
+            user_feedback_state[user_id] = False
+            bot.send_message(
+                ADMIN_ID, 
+                f"📩 **رسالة/ملاحظة جديدة:**\n\nمن: {message.from_user.first_name}\n(ID: `{user_id}`)\n\nالرسالة:\n{text}\n\n*(للرد على هذا الطالب، قم بعمل Reply على هذه الرسالة واكتب ردك)*", 
+                parse_mode="Markdown"
+            )
+            bot.send_message(chat_id, "✅ تم إرسال ملاحظتك بنجاح للإدارة، شكراً لك!")
+            return
+
+        # ---- عرض الإعلانات العامّة ----
+        if text == "📌 الإعلانات والبرنامج":
+            ann = get_latest_announcement()
+            if ann:
+                c_type, text_content, file_id = ann
+                if c_type == 'text':
+                    bot.send_message(chat_id, f"📌 **آخر الإعلانات:**\n\n{text_content}", parse_mode="Markdown")
+                elif c_type == 'photo':
+                    bot.send_photo(chat_id, file_id, caption=text_content)
+                elif c_type == 'document':
+                    bot.send_document(chat_id, file_id, caption=text_content)
+            else:
+                bot.send_message(chat_id, "ℹ️ لا توجد إعلانات منشورة حالياً.")
+            return
+
+        # ---- البحث السريع عن المحاضرات ----
+        if text == "🔍 بحث عن محاضرة":
+            user_states[chat_id] = {"search": True}
+            bot.send_message(chat_id, "أدخل اسم المادة أو المحاضرة التي تبحث عنها (مثال: فيزيا):")
+            return
+
+        if user_states.get(chat_id, {}).get("search"):
+            user_states[chat_id]["search"] = False
+            results = search_files_in_db(text)
+            if results:
+                bot.send_message(chat_id, f"🔎 **نتائج البحث عن [{text}]:**", parse_mode="Markdown")
+                for mat_name, lec_name, f_id in results:
+                    bot.send_document(chat_id, f_id, caption=f"📄 {lec_name} - مادة {mat_name}")
+            else:
+                bot.send_message(chat_id, f"❌ لم يتم العثور على أي محاضرة تطابق: [{text}]")
             return
 
         # ---- التنقل الرئيسي ----
@@ -432,4 +732,3 @@ def callback_handler(call):
 if __name__ == "__main__":
     print("البوت يعمل بنجاح...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
