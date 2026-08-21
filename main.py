@@ -16,10 +16,12 @@ CHANNEL_USERNAME = "@Hamak456"
 ADMIN_ID = 7547218555
 
 bot = telebot.TeleBot(TOKEN)
-# ضبط قائمة الأوامر التي تظهر بجانب صندوق الكتابة
+
+# ضبط قائمة الأوامر (تظهر زر القائمة Menu بجانب صندوق الكتابة)
 bot.set_my_commands([
-    telebot.types.BotCommand("start", "إعادة تشغيل")
+    telebot.types.BotCommand("start", "إعادة تشغيل البوت")
 ])
+
 user_states = {}
 last_interaction_time = {}
 admin_broadcast_state = {}
@@ -142,17 +144,6 @@ def get_file_from_db(db_key, material_name, lecture_name):
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else None
-
-def save_announcement(content_type, text_content, file_id=None):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM announcements')
-    cursor.execute('''
-        INSERT INTO announcements (content_type, text_content, file_id)
-        VALUES (?, ?, ?)
-    ''', (content_type, text_content, file_id))
-    conn.commit()
-    conn.close()
 
 def save_exam_schedule(file_id):
     conn = sqlite3.connect('bot_database.db')
@@ -366,17 +357,13 @@ def handle_admin_media(message):
     user_id = message.from_user.id
     if user_id == ADMIN_ID:
         file_id = None
-        content_type = 'text'
         
         if message.document:
             file_id = message.document.file_id
-            content_type = 'document'
         elif message.photo:
             file_id = message.photo[-1].file_id
-            content_type = 'photo'
         elif message.video:
             file_id = message.video.file_id
-            content_type = 'video'
 
         if admin_exam_schedule_state.get(user_id):
             if file_id:
@@ -572,7 +559,14 @@ def handle_all_messages(message):
         # ---- التنقل الرئيسي ----
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
-            bot.send_message(chat_id, "أهلاً بالمهندس العظيم! اختر السنة الدراسية:", reply_markup=get_years_keyboard())
+            welcome_text = (
+                f"👋 **أهلاً بك يا مهندسنا العظيم  {message.from_user.first_name}!**\n\n"
+                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                f"🎓 هذا البوت باشراف ممثل الاتصالات.\n"
+                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
+            )
+            bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
             return
 
         years_map = {"السنة الأولى 1️⃣": 1, "السنة الثانية 2️⃣": 2, "السنة الثالثة 3️⃣": 3, "السنة الرابعة 4️⃣": 4, "السنة الخامسة 5️⃣": 5}
@@ -631,19 +625,27 @@ def handle_all_messages(message):
                     )
                     return
 
-    c_mat = user_states.get(chat_id, {}).get("material")
+            c_mat = user_states.get(chat_id, {}).get("material")
             if c_mat:
                 file_id = get_file_from_db(db_key, c_mat, text)
                 if file_id:
-                    bot.send_document(chat_id, file_id, caption=f"📄 {text} - مادة {c_mat}")
+                    bot.send_chat_action(chat_id, 'upload_document')
+                    caption_text = (
+                        f"📌 **المادة:** {c_mat}\n"
+                        f"📑 **المحتوى:** {text}\n\n"
+                        f"✨ بالتوفيق والنجاح!"
+                    )
+                    bot.send_document(chat_id, file_id, caption=caption_text, parse_mode="Markdown")
                 else:
                     bot.send_message(
                         chat_id, 
-                        f"⏳ المحاضرة لم تُعطَ بعد.\n\nلم يتم رفع ملف [{text}] لمادة [{c_mat}]، وسيتم إضافته فور صدوره رسمياً.", 
+                        f"⏳ **المحاضرة لم تُعطَ بعد**\n\n"
+                        f"📖 لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.\n"
+                        f"🔔 سيتم إدراجها فور صدورها رسمياً.", 
                         parse_mode="Markdown"
                     )
                 return
-           
+
     except Exception as e:
         print(f"حدث خطأ: {e}")
 
