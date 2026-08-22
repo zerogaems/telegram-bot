@@ -526,10 +526,13 @@ def handle_all_messages(message):
         if text in ["/start", "ابدأ من جديد 🔄", "🏠 العودة للرئيسية"]:
             user_states[chat_id] = {"year": None, "sem": None, "material": None}
             welcome_text = (
-                f"👋 **أهلاً بك يا مهندس {first_name}!**\n\n"
-                f"🎓 مرحباً بك في البوت الأكاديمي المساعد.\n"
-                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
+
+                    f"👋 **أهلاً بك يا  {first_name}!**\n"
+                    f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                    f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                    f"🎓 هذا البوت باشراف ممثل الاتصالات.\n" 
+                    f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
+                
             )
             bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
             return
@@ -604,8 +607,7 @@ def handle_all_messages(message):
                 else:
                     bot.send_message(
                         chat_id, 
-                        f"⏳ **المحاضرة لم تُعطَ بعد**\n\n"
-                        f"📖 لم يتم رفع ملف [{text}] لمادة [{c_mat}] حتى الآن.\n"
+                        f"⏳ **المحاضرة لم تُعطَ بعد**\n"
                         f"🔔 سيتم إدراجها فور صدورها رسمياً.", 
                         parse_mode="Markdown"
                     )
@@ -638,9 +640,10 @@ def callback_handler(call):
                 
                 first_name = call.from_user.first_name if call.from_user and call.from_user.first_name else "المهندس"
                 welcome_text = (
-                    f"👋 **أهلاً بك يا مهندس {first_name}!**\n\n"
-                    f"🎓 مرحباً بك في البوت الأكاديمي المساعد.\n"
+                    f"👋 **أهلاً بك يا  {first_name}!**\n"
+                    f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                     f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                    f"🎓 هذا البوت باشراف ممثل الاتصالات.\n" 
                     f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
                 )
                 bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
