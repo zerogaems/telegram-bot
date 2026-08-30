@@ -668,7 +668,7 @@ def handle_all_messages(message):
                 for mat in materials:
                     if mat["name"] == c_mat and text in mat["content"]:
                         val = mat["content"][text]
-                        if val and val != ["ضع_هنا_file_id" , "PAST_FILE_ID_HERE"]:
+                        if val and val != "PAST_FILE_ID_HERE":
                             file_id = val
                         break
                 
