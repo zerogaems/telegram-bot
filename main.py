@@ -381,8 +381,6 @@ def get_years_keyboard():
     markup.row("السنة الأولى 1️⃣", "السنة الثانية 2️⃣")
     markup.row("السنة الثالثة 3️⃣", "السنة الرابعة 4️⃣")
     markup.row("السنة الخامسة 5️⃣")
-    markup.row("🔎 بحث", "⭐ المفضلة")
-    markup.row("🕘 آخر المحاضرات")
     markup.row("💬 أرسل ملاحظة/استفسار", "📅 برنامج الامتحان")
     return markup
 
@@ -415,7 +413,6 @@ def get_content_keyboard(content_dict, db_key, material_name, user_id):
     if row: markup.row(*row)
     if "📝 دورات سابقة" in content_dict:
         markup.row("📝 دورات سابقة")
-    markup.row("⭐ المفضلة لهذه المادة")
     markup.row("🔙 رجوع للمواد", "🏠 العودة للرئيسية")
     return markup
 
@@ -847,18 +844,6 @@ def handle_all_messages(message):
             bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
             return
 
-        # Favorites / recent
-        if text in ("⭐ المفضلة", "🕘 آخر المحاضرات"):
-            rows = get_favorites(uid) if text == "⭐ المفضلة" else get_recent(uid)
-            title = "المفضلة" if text == "⭐ المفضلة" else "آخر المحاضرات"
-            if not rows:
-                bot.send_message(chat_id, f"لا توجد عناصر في {title} بعد."); return
-            lines = [f"<b>{title}</b>"]
-            for db_key, mat, lec in rows:
-                lines.append(f"• {escape(mat)} — {escape(lec)}\n  <code>{db_key}</code>")
-            bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
-            return
-
         # Navigation
         years_map = {"السنة الأولى 1️⃣":1, "السنة الثانية 2️⃣":2, "السنة الثالثة 3️⃣":3, "السنة الرابعة 4️⃣":4, "السنة الخامسة 5️⃣":5}
         if text in years_map:
@@ -905,12 +890,7 @@ def handle_all_messages(message):
                                  reply_markup=get_content_keyboard(mat.get("content", {}), db_key, text, uid), parse_mode="HTML")
                 return
 
-            if text == "⭐ المفضلة لهذه المادة":
-                rows = [r for r in get_favorites(uid) if r[0] == db_key and r[1] == state.get("material")]
-                if not rows:
-                    bot.send_message(chat_id, "لا توجد مفضلات لهذه المادة."); return
-                bot.send_message(chat_id, "⭐\n" + "\n".join(f"• {escape(r[2])}" for r in rows), parse_mode="HTML")
-                return
+       
 
             material = state.get("material")
             if material:
@@ -924,8 +904,6 @@ def handle_all_messages(message):
                         bot.send_chat_action(chat_id, "upload_document")
                         bot.send_document(chat_id, file_id, caption=f"📌 المادة: {material}\n📑 المحتوى: {text}\n\n✨ بالتوفيق والنجاح!")
                         record_download(uid, db_key, material, text)
-                        fav = "⭐ إزالة من المفضلة" if any(r[0]==db_key and r[1]==material and r[2]==text for r in get_favorites(uid)) else "⭐ إضافة للمفضلة"
-                        bot.send_message(chat_id, fav)
                     except Exception:
                         logger.exception("Document send failed")
                         bot.send_message(chat_id, "❌ تعذر إرسال الملف حاليًا. حاول لاحقًا.")
