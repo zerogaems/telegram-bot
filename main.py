@@ -618,7 +618,7 @@ def handle_all_messages(message):
             if text == "🏠 العودة للرئيسية":
                 clear_admin_state(uid)
                 reset_user_state(chat_id)
-                bot.send_message(chat_id, "🏠 اختر من لوحة الأدمن عبر /admin أو ابدأ تصفح البوت.", reply_markup=get_years_keyboard())
+                bot.send_message(chat_id, "صلي على النبي.", reply_markup=get_years_keyboard())
                 return
 
             # Persistent admin workflows.
