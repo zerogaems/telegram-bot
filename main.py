@@ -592,7 +592,7 @@ def handle_all_messages(message):
                 f"👋 **أهلاً بك يا {first_name}!**\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"🎓 هذا البوت بإشراف ممثل الاتصالات.\n"
+                 f"🎓هذا البوت صنع بواسطة Y0USSEF_SABRA \n"
                 f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
             )
             bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
@@ -719,7 +719,7 @@ def callback_handler(call):
                     f"👋 **أهلاً بك يا {first_name}!**\n"
                     f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                     f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                    f"🎓 هذا البوت بإشراف ممثل الاتصالات.\n"
+                    f"🎓هذا البوت صنع بواسطة Y0USSEF_SABRA \n"
                     f"👇 **يرجى اختيار السنة الدراسية للبدء:**"
                 )
                 bot.send_message(chat_id, welcome_text, reply_markup=get_years_keyboard(), parse_mode="Markdown")
