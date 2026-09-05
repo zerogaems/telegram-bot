@@ -694,9 +694,17 @@ def handle_all_messages(message):
 
         if text == "/start" or text == "ابدأ من جديد 🔄" or text == "🏠 العودة للرئيسية":
             reset_user_state(chat_id)
-            welcome = (f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n\n"
-                       "🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                       "📚 اختر السنة الدراسية للبدء:")
+            welcome = (
+        
+
+        f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
+        f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+        f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+        f"🎓 صنع هذا البوت بواسطة @Y0USSEF_SABRA.\n\n"
+        f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
+             
+                      
+                      )
             bot.send_message(chat_id, welcome, reply_markup=get_years_keyboard(), parse_mode="HTML")
             return
 
