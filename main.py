@@ -905,11 +905,11 @@ def handle_all_messages(message):
                         return
                     try:
                         bot.send_chat_action(chat_id, "upload_document")
-                        bot.send_document(chat_id, file_id, caption=f"📌 المادة: {material}\n📑 المحتوى: {text}\n\n✨ بالتوفيق والنجاح!")
+                        bot.send_document(chat_id, file_id, caption=f"📌 المادة: {material}\n📑 المحتوى: {text}\n\n")
                         record_download(uid, db_key, material, text)
                     except Exception:
                         logger.exception("Document send failed")
-                        bot.send_message(chat_id, "❌ تعذر إرسال الملف حاليًا. حاول لاحقًا.")
+                        bot.send_message(chat_id, "✨ بالتوفيق والنجاح!")
                     return
 
     except Exception:
