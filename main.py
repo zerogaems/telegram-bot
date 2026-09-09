@@ -778,7 +778,7 @@ def handle_all_messages(message):
                 f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
                 f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                 f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"🎓 صنع هذا البوت @Y0USSEF_SABRA.\n"
+                f"🎓 صنع هذا البوت @Youssef_Sabra.\n"
                 f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
             )
             bot.send_message(
@@ -938,7 +938,7 @@ def callback_handler(call):
                     f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
                     f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
                     f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n"
-                    f"🎓 صنع هذا البوت @Y0USSEF_SABRA.\n\n"
+                    f"🎓 صنع هذا البوت @Youssef_Sabra.\n\n"
                     f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
                 )
                 bot.send_message(
