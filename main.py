@@ -346,7 +346,17 @@ def find_file_id(db_key, material_name, lecture_name):
     mat = find_material(db_key, material_name)
     if not mat:
         return None
-    value = mat.get("content", {}).get(lecture_name)
+
+    content = mat.get("content", {})
+    # نبحث بالاسم كما هو أولاً، ثم نتجاهل المسافات الزائدة.
+    value = content.get(lecture_name)
+    if value is None:
+        wanted = lecture_name.strip()
+        for key, candidate in content.items():
+            if key.strip() == wanted:
+                value = candidate
+                break
+
     if value in (None, "", "PASTE_FILE_ID_HERE", "ضع_هنا_file_id"):
         return None
     return value
@@ -898,19 +908,26 @@ def handle_all_messages(message):
             material = state.get("material")
             if material:
                 mat = find_material(db_key, material)
-                if mat and text in mat.get("content", {}):
-                    file_id = find_file_id(db_key, material, text)
-                    if not file_id:
-                        bot.send_message(chat_id, "⏳ هذه المحاضرة لم تُرفع بعد.")
+                if mat:
+                    # Telegram قد يعيد النص مع مسافات مختلفة؛ نطابق الاسم بعد strip.
+                    content_key = next((k for k in mat.get("content", {}) if k.strip() == text.strip()), None)
+                    if content_key is not None:
+                        file_id = find_file_id(db_key, material, content_key)
+                        if not file_id:
+                            bot.send_message(chat_id, "⏳ هذه المحاضرة لم تُرفع بعد.")
+                            return
+                        try:
+                            bot.send_chat_action(chat_id, "upload_document")
+                            bot.send_document(
+                                chat_id,
+                                file_id,
+                                caption=f"📌 المادة: {material}\n📑 المحتوى: {content_key}\n\n"
+                            )
+                            record_download(uid, db_key, material, content_key)
+                        except Exception as exc:
+                            logger.exception("Document send failed for %s / %s", material, content_key)
+                            bot.send_message(chat_id, "⚠️ تعذر إرسال الملف حالياً. تأكد من File ID الخاص بهذه الجلسة.")
                         return
-                    try:
-                        bot.send_chat_action(chat_id, "upload_document")
-                        bot.send_document(chat_id, file_id, caption=f"📌 المادة: {material}\n📑 المحتوى: {text}\n\n")
-                        record_download(uid, db_key, material, text)
-                    except Exception:
-                        logger.exception("Document send failed")
-                        bot.send_message(chat_id, "✨ بالتوفيق والنجاح!")
-                    return
 
     except Exception:
         logger.exception("Unhandled message error")
