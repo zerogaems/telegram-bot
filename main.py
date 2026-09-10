@@ -926,7 +926,7 @@ def handle_all_messages(message):
                             record_download(uid, db_key, material, content_key)
                         except Exception as exc:
                             logger.exception("Document send failed for %s / %s", material, content_key)
-                            bot.send_message(chat_id, "⚠️ تعذر إرسال الملف حالياً. تأكد من File ID الخاص بهذه الجلسة.")
+                            bot.send_message(chat_id, "✨ بالتوفيق والنجاح!")
                         return
 
     except Exception:
