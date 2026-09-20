@@ -18,7 +18,7 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Add it to Render Environment Variables.")
 
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@Hamak456").strip()
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@ECE_Latakia").strip()
 ADMIN_IDS = {
     int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7547218555").split(",")
     if x.strip().isdigit()
