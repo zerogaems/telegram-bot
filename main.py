@@ -434,7 +434,7 @@ def get_admin_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("📊 إحصائيات البوت", "📢 إرسال إذاعة")
     markup.row("📎 استخراج File ID", "🧾 تجهيز سطر ملف")
-    markup.row("🗑️ تجهيز حذف من الكود", "📸 برنامج الامتحان")
+    markup.row("🗑️ تجهيز حذف من الكود", "📸 برنامج الاسبوع")
     markup.row("📦 نسخة احتياطية", "🚫 حظر / إلغاء حظر")
     markup.row("📜 سجل الإدارة", "🏠 العودة للرئيسية")
     return markup
@@ -653,9 +653,9 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, "📎 أرسل الآن الملف/الصورة/الفيديو. سأعطيك File ID فقط ولن أغيّر الكود تلقائيًا.")
                 return
 
-            if text == "📸 برنامج الامتحان":
+            if text == "📸 برنامج الاسبوع":
                 set_admin_state(uid, action="exam_schedule")
-                bot.send_message(chat_id, "📸 أرسل صورة/ملف برنامج الامتحان. سيُحفظ في قاعدة الإعدادات.")
+                bot.send_message(chat_id, "📸 أرسل صورة/ملف برنامج الاسبوع. سيُحفظ في قاعدة الإعدادات.")
                 return
 
             if text == "📢 إرسال إذاعة":
@@ -806,7 +806,7 @@ def handle_all_messages(message):
             return
 
         # Exam schedule
-        if text == "📅 برنامج الامتحان":
+        if text == "📅 برنامج الاسبوع":
             with db_connect() as conn:
                 row = conn.execute("SELECT value FROM settings WHERE key='exam_schedule_file_id'").fetchone()
             if not row:
