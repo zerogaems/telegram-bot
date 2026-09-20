@@ -395,7 +395,7 @@ def get_years_keyboard():
     markup.row("السنة الأولى 1️⃣", "السنة الثانية 2️⃣")
     markup.row("السنة الثالثة 3️⃣", "السنة الرابعة 4️⃣")
     markup.row("السنة الخامسة 5️⃣")
-    markup.row("💬 أرسل ملاحظة/استفسار", "📅 برنامج الامتحان")
+    markup.row("💬 أرسل ملاحظة/استفسار", "📅 برنامج الاسبوع")
     return markup
 
 def get_semesters_keyboard():
@@ -597,7 +597,7 @@ def handle_media(message):
             conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('exam_schedule_file_id',?)", (file_id,))
         clear_admin_state(uid)
         audit(uid, "exam_schedule_updated", "", f"type={file_type}")
-        bot.reply_to(message, "✅ تم حفظ ملف برنامج الامتحان.")
+        bot.reply_to(message, "✅ تم حفظ ملف برنامج الاسبوع.")
         return
     if state.get("action") == "get_file_id":
         clear_admin_state(uid)
@@ -810,12 +810,12 @@ def handle_all_messages(message):
             with db_connect() as conn:
                 row = conn.execute("SELECT value FROM settings WHERE key='exam_schedule_file_id'").fetchone()
             if not row:
-                bot.send_message(chat_id, "ℹ️ لم يتم رفع برنامج الامتحان بعد.")
+                bot.send_message(chat_id, "ℹ️ لم يتم رفع برنامج الاسببوع بعد.")
             else:
                 try:
-                    bot.send_photo(chat_id, row[0], caption="📅 برنامج الامتحانات الرسمية:")
+                    bot.send_photo(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
                 except Exception:
-                    bot.send_document(chat_id, row[0], caption="📅 برنامج الامتحانات الرسمية:")
+                    bot.send_document(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
             return
 
         # Feedback
