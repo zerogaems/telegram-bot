@@ -1,8 +1,11 @@
+import io
+import json
 import os
 import time
-import sqlite3
+import libsql
 import logging
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from html import escape
 from collections import defaultdict, deque
@@ -23,7 +26,10 @@ ADMIN_IDS = {
     int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7547218555").split(",")
     if x.strip().isdigit()
 }
-DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+if not TURSO_URL or not TURSO_AUTH_TOKEN:
+    raise RuntimeError("TURSO_DATABASE_URL و TURSO_AUTH_TOKEN مطلوبين. أضفهما في Render Environment Variables.")
 RATE_WINDOW = 10
 RATE_LIMIT = 8
 FEEDBACK_WINDOW = 3600
@@ -58,73 +64,84 @@ def run_web():
 threading.Thread(target=run_web, daemon=True, name="web-server").start()
 
 # ============================================================
-# DATABASE
+# DATABASE (Turso - سحابي دائم بدل ملف SQLite محلي بينمسح على Render)
 # ============================================================
+@contextmanager
 def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    """يفتح اتصال جديد بقاعدة Turso، وبيضمن إقفاله دايماً حتى لو صار خطأ
+    (نفس أسلوب استخدام sqlite3 القديم بالكود ما تغير - with db_connect() as conn)."""
+    conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 def init_db():
-    with db_connect() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
+    # نفذنا كل جملة CREATE لحالها (بدل executescript) لأن اتصال Turso البعيد
+    # ما بيدعم بالضرورة تنفيذ عدة جمل SQL بضربة واحدة.
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             first_name TEXT,
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS banned_users (
+        )""",
+        """CREATE TABLE IF NOT EXISTS banned_users (
             user_id INTEGER PRIMARY KEY,
             banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS settings (
+        )""",
+        """CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS announcements (
+        )""",
+        """CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content_type TEXT,
             text_content TEXT,
             file_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS audit_logs (
+        )""",
+        """CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_id INTEGER,
             action TEXT NOT NULL,
             target TEXT,
             details TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS downloads (
+        )""",
+        """CREATE TABLE IF NOT EXISTS downloads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             db_key TEXT NOT NULL,
             material_name TEXT NOT NULL,
             lecture_name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS favorites (
+        )""",
+        """CREATE TABLE IF NOT EXISTS favorites (
             user_id INTEGER NOT NULL,
             db_key TEXT NOT NULL,
             material_name TEXT NOT NULL,
             lecture_name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (user_id, db_key, material_name, lecture_name)
-        );
-        CREATE TABLE IF NOT EXISTS recent_views (
+        )""",
+        """CREATE TABLE IF NOT EXISTS recent_views (
             user_id INTEGER NOT NULL,
             db_key TEXT NOT NULL,
             material_name TEXT NOT NULL,
             lecture_name TEXT NOT NULL,
             viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (user_id, db_key, material_name, lecture_name)
-        );
-        CREATE TABLE IF NOT EXISTS feedback (
+        )""",
+        """CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             first_name TEXT,
@@ -133,8 +150,8 @@ def init_db():
             status TEXT DEFAULT 'open',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             replied_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS broadcast_jobs (
+        )""",
+        """CREATE TABLE IF NOT EXISTS broadcast_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_id INTEGER NOT NULL,
             content TEXT NOT NULL,
@@ -144,12 +161,15 @@ def init_db():
             failed INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             finished_at TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id);
-        CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at);
-        CREATE INDEX IF NOT EXISTS idx_recent_user ON recent_views(user_id, viewed_at);
-        CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id);
-        """)
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_recent_user ON recent_views(user_id, viewed_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id)""",
+    ]
+    with db_connect() as conn:
+        for stmt in statements:
+            conn.execute(stmt)
 
 init_db()
 
@@ -435,7 +455,7 @@ def get_admin_keyboard():
     markup.row("📊 إحصائيات البوت", "📢 إرسال إذاعة")
     markup.row("📎 استخراج File ID", "🧾 تجهيز سطر ملف")
     markup.row("🗑️ تجهيز حذف من الكود", "📸 برنامج الاسبوع")
-    markup.row("📦 نسخة احتياطية", "🚫 حظر / إلغاء حظر")
+    markup.row("📦 نسخة احتياطية", "🚫 حظر / إلغاء حظر مستخدم")
     markup.row("📜 سجل الإدارة", "🏠 العودة للرئيسية")
     return markup
 
@@ -477,7 +497,7 @@ def record_download(user_id, db_key, material, lecture):
         conn.execute("INSERT INTO downloads(user_id,db_key,material_name,lecture_name) VALUES(?,?,?,?)",
                      (user_id, db_key, material, lecture))
         conn.execute("""INSERT INTO recent_views(user_id,db_key,material_name,lecture_name)
-                       VALUES(?,?,?,?,?) ON CONFLICT(user_id,db_key,material_name,lecture_name)
+                       VALUES(?,?,?,?) ON CONFLICT(user_id,db_key,material_name,lecture_name)
                        DO UPDATE SET viewed_at=CURRENT_TIMESTAMP""", (user_id, db_key, material, lecture))
 
 def toggle_favorite(user_id, db_key, material, lecture):
@@ -554,13 +574,23 @@ def start_broadcast(admin_id, text):
 # ============================================================
 # BACKUP
 # ============================================================
+BACKUP_TABLES = ["users", "banned_users", "settings", "audit_logs", "downloads",
+                 "favorites", "recent_views", "feedback", "broadcast_jobs"]
+
 def send_backup(chat_id):
-    if not os.path.exists(DB_PATH):
-        bot.send_message(chat_id, "❌ قاعدة البيانات غير موجودة.")
-        return
+    # ما في ملف SQLite محلي بعد الانتقال لـ Turso، فنبني نسخة JSON من كل
+    # الجداول مباشرة من قاعدة البيانات السحابية ونرسلها كملف.
     try:
-        with open(DB_PATH, "rb") as doc:
-            bot.send_document(chat_id, doc, caption=f"📦 نسخة احتياطية\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        backup = {}
+        with db_connect() as conn:
+            for table in BACKUP_TABLES:
+                cur = conn.execute(f"SELECT * FROM {table}")
+                cols = [d[0] for d in cur.description]
+                backup[table] = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        buf = io.BytesIO(json.dumps(backup, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+        buf.name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        bot.send_document(chat_id, buf, caption=f"📦 نسخة احتياطية (JSON)\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\nℹ️ يمكنك أيضاً تنزيل نسخة SQLite كاملة مباشرة من لوحة Turso (زر Export Database).")
         audit(chat_id, "manual_backup")
     except Exception:
         logger.exception("Backup failed")
@@ -835,8 +865,12 @@ def handle_all_messages(message):
                 cur = conn.execute("INSERT INTO feedback(user_id,first_name,message) VALUES(?,?,?)", (uid, first_name, text[:4000]))
                 fid = cur.lastrowid
             safe = escape(text[:4000])
-            bot.send_message(ADMIN_IDS and next(iter(ADMIN_IDS)),
-                             f"📩 <b>ملاحظة #{fid}</b>\nمن: {escape(first_name)}\nID: <code>{uid}</code>\n\n{safe}\n\nللرد: استخدم Reply على هذه الرسالة ثم اكتب الرد.", parse_mode="HTML")
+            for admin_id in ADMIN_IDS:
+                try:
+                    bot.send_message(admin_id,
+                                     f"📩 <b>ملاحظة #{fid}</b>\nمن: {escape(first_name)}\nID: <code>{uid}</code>\n\n{safe}\n\nللرد: استخدم Reply على هذه الرسالة ثم اكتب الرد.", parse_mode="HTML")
+                except Exception:
+                    logger.exception("Failed to notify admin %s about feedback", admin_id)
             bot.send_message(chat_id, "✅ تم إرسال ملاحظتك للإدارة. شكرًا لك!")
             return
 
