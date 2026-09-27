@@ -1,903 +1,1039 @@
 import io
+import json
 import os
-import re
 import time
-import logging
 import libsql
-from threading import Thread
+import logging
+import threading
+from contextlib import contextmanager
+from datetime import datetime
+from html import escape
+from collections import defaultdict, deque
 from flask import Flask
-import pandas as pd
 import telebot
-from telebot import types
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-)
-logger = logging.getLogger('freshmen_bot')
+# ============================================================
+# SECURE CONFIGURATION
+# ============================================================
+# IMPORTANT: never put the bot token in this file or GitHub.
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Add it to Render Environment Variables.")
 
-# ==================== خادم Flask لإرضاء Render و UptimeRobot ====================
-app = Flask('')
-
-
-@app.route('/')
-def home():
-  return 'Freshman Verification Bot - Fully Secure & Active!'
-
-
-def run_flask():
-  port = int(os.environ.get('PORT', 8080))
-  app.run(host='0.0.0.0', port=port)
-
-
-# ==================== الإعدادات الأساسية ====================
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
-if not BOT_TOKEN:
-  raise RuntimeError('يجب ضبط متغير البيئة BOT_TOKEN قبل تشغيل البوت.')
-
-# يدعم أكثر من أدمن دفعة واحدة: ضع الآيديات مفصولة بفواصل، مثلاً:
-# ADMIN_IDS=7547218555,123456789,987654321
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@ECE_Latakia").strip()
 ADMIN_IDS = {
-    int(x.strip())
-    for x in os.environ.get('ADMIN_IDS', '7547218555').split(',')
+    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7547218555").split(",")
     if x.strip().isdigit()
 }
-
-
-def is_admin(user_id):
-  return user_id in ADMIN_IDS
-
-
-def notify_all_admins(send_func):
-  """يستدعي send_func(admin_id) لكل أدمن، ويتجاوز أي أدمن فشل إرسال الرسالة
-  له (مثلاً حظر البوت) بدون ما يوقف إشعار باقي الأدمنية."""
-  for admin_id in ADMIN_IDS:
-    try:
-      send_func(admin_id)
-    except Exception as e:
-      logger.warning('فشل إشعار الأدمن %s: %s', admin_id, e)
-
-
-FRESHMAN_LECTURES_ID = int(
-    os.environ.get('FRESHMAN_LECTURES_ID', '-1004413316628')
-)
-FRESHMAN_DISCUSSION_ID = int(
-    os.environ.get('FRESHMAN_DISCUSSION_ID', '-1003953300954')
-)
-
-bot = telebot.TeleBot(BOT_TOKEN)
-user_sessions = {}
-admin_input_states = {}
-
-# ==================== الاتصال بقاعدة بيانات Turso (بدل ملف SQLite محلي) ====================
-TURSO_URL = os.environ.get('TURSO_DATABASE_URL', '').strip()
-TURSO_AUTH_TOKEN = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 if not TURSO_URL or not TURSO_AUTH_TOKEN:
-  raise RuntimeError(
-      'يجب ضبط TURSO_DATABASE_URL و TURSO_AUTH_TOKEN كمتغيرات بيئة قبل'
-      ' التشغيل.'
-  )
+    raise RuntimeError("TURSO_DATABASE_URL و TURSO_AUTH_TOKEN مطلوبين. أضفهما في Render Environment Variables.")
+RATE_WINDOW = 10
+RATE_LIMIT = 8
+FEEDBACK_WINDOW = 3600
+FEEDBACK_LIMIT = 3
+SUB_CACHE_SECONDS = 60
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("student_bot")
 
+bot = telebot.TeleBot(TOKEN, threaded=True)
+
+# ============================================================
+# IN-MEMORY STATE (short-lived only; persistent data stays in DB)
+# ============================================================
+user_states = {}
+admin_states = {}
+rate_buckets = defaultdict(deque)
+feedback_buckets = defaultdict(deque)
+subscription_cache = {}
+state_lock = threading.RLock()
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "OK", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+threading.Thread(target=run_web, daemon=True, name="web-server").start()
+
+# ============================================================
+# DATABASE (Turso - سحابي دائم بدل ملف SQLite محلي بينمسح على Render)
+# ============================================================
+@contextmanager
 def db_connect():
-  """يفتح اتصال جديد بقاعدة Turso. الواجهة نفس sqlite3 تقريباً (cursor /
-  execute / commit / close) لذلك باقي الكود ما احتاج تعديل كبير.
-  فيها إعادة محاولة تلقائية لو صار خطأ عابر (busy/idle stream) لحظة الاتصال."""
-  last_err = None
-  for attempt in range(3):
+    """يفتح اتصال جديد بقاعدة Turso، وبيضمن إقفاله دايماً حتى لو صار خطأ
+    (نفس أسلوب استخدام sqlite3 القديم بالكود ما تغير - with db_connect() as conn).
+    فيها إعادة محاولة تلقائية لفتح الاتصال لو صار خطأ عابر (busy/idle stream)."""
+    conn = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning("db_connect attempt %s failed: %s", attempt + 1, e)
+            time.sleep(0.5 * (attempt + 1))
+    if conn is None:
+        raise last_err
+
     try:
-      return libsql.connect(database=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
-    except Exception as e:
-      last_err = e
-      logger.warning('db_connect attempt %s failed: %s', attempt + 1, e)
-      time.sleep(0.5 * (attempt + 1))
-  raise last_err
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
-
-# ==================== تنظيف أرقام الهواتف ====================
-def clean_phone(phone_str):
-  if not phone_str:
-    return ''
-  digits = re.sub(r'\D', '', str(phone_str))
-  if digits.startswith('963'):
-    digits = '0' + digits[3:]
-  elif digits.startswith('00963'):
-    digits = '0' + digits[5:]
-  if len(digits) == 9 and digits.startswith('9'):
-    digits = '0' + digits
-  return digits
-
-
-# ==================== تهيئة قاعدة البيانات والأرشيف ====================
 def init_db():
-  conn = db_connect()
-  cursor = conn.cursor()
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS freshmen (
-            telegram_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            phone TEXT,
-            admission_photo_id TEXT,
-            id_photo_id TEXT,
-            status TEXT DEFAULT 'pending',
+    # نفذنا كل جملة CREATE لحالها (بدل executescript) لأن اتصال Turso البعيد
+    # ما بيدعم بالضرورة تنفيذ عدة جمل SQL بضربة واحدة.
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active INTEGER DEFAULT 1
+        )""",
+        """CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_type TEXT,
+            text_content TEXT,
+            file_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-  cursor.execute('PRAGMA table_info(freshmen)')
-  columns = [info[1] for info in cursor.fetchall()]
-  if 'admission_photo_id' not in columns:
-    cursor.execute('ALTER TABLE freshmen ADD COLUMN admission_photo_id TEXT')
-  if 'id_photo_id' not in columns:
-    cursor.execute('ALTER TABLE freshmen ADD COLUMN id_photo_id TEXT')
-
-  conn.commit()
-  conn.close()
-
+        )""",
+        """CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            action TEXT NOT NULL,
+            target TEXT,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS downloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            db_key TEXT NOT NULL,
+            material_name TEXT NOT NULL,
+            lecture_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER NOT NULL,
+            db_key TEXT NOT NULL,
+            material_name TEXT NOT NULL,
+            lecture_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, db_key, material_name, lecture_name)
+        )""",
+        """CREATE TABLE IF NOT EXISTS recent_views (
+            user_id INTEGER NOT NULL,
+            db_key TEXT NOT NULL,
+            material_name TEXT NOT NULL,
+            lecture_name TEXT NOT NULL,
+            viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, db_key, material_name, lecture_name)
+        )""",
+        """CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            first_name TEXT,
+            message TEXT NOT NULL,
+            admin_reply TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            replied_at TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS broadcast_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            total INTEGER DEFAULT 0,
+            success INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_recent_user ON recent_views(user_id, viewed_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id)""",
+    ]
+    with db_connect() as conn:
+        for stmt in statements:
+            conn.execute(stmt)
 
 init_db()
 
+# ============================================================
+# HELPERS / SECURITY
+# ============================================================
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
-# ==================== لوحة تحكم الأدمن (/admin) ====================
+def audit(admin_id, action, target="", details=""):
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO audit_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
+                         (admin_id, action, str(target)[:200], str(details)[:1000]))
+    except Exception:
+        logger.exception("Audit log failed")
+
+def is_user_banned(user_id):
+    with db_connect() as conn:
+        return conn.execute("SELECT 1 FROM banned_users WHERE user_id=?", (user_id,)).fetchone() is not None
+
+def ban_user(user_id):
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO banned_users(user_id) VALUES(?)", (user_id,))
+
+def unban_user(user_id):
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
+        return cur.rowcount > 0
+
+def add_user(user_id, first_name):
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO users(user_id, first_name) VALUES(?, ?)
+                       ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name,
+                       last_seen=CURRENT_TIMESTAMP, is_active=1""", (user_id, first_name[:100]))
+
+def mark_user_inactive(user_id):
+    with db_connect() as conn:
+        conn.execute("UPDATE users SET is_active=0 WHERE user_id=?", (user_id,))
+
+def get_all_users():
+    with db_connect() as conn:
+        return [r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_active=1 ORDER BY user_id")]
+
+def get_users_count():
+    with db_connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+def rate_allowed(user_id):
+    now = time.monotonic()
+    with state_lock:
+        q = rate_buckets[user_id]
+        while q and now - q[0] > RATE_WINDOW:
+            q.popleft()
+        if len(q) >= RATE_LIMIT:
+            return False
+        q.append(now)
+        return True
+
+def feedback_allowed(user_id):
+    now = time.monotonic()
+    with state_lock:
+        q = feedback_buckets[user_id]
+        while q and now - q[0] > FEEDBACK_WINDOW:
+            q.popleft()
+        if len(q) >= FEEDBACK_LIMIT:
+            return False
+        q.append(now)
+        return True
+
+def cleanup_states():
+    while True:
+        time.sleep(600)
+        cutoff = time.monotonic() - 3600
+        with state_lock:
+            # States are timestamped as (state, updated_at).
+            for store in (user_states, admin_states):
+                for uid in list(store):
+                    value = store[uid]
+                    if isinstance(value, dict) and value.get("_updated", time.monotonic()) < cutoff:
+                        store.pop(uid, None)
+            for uid in list(subscription_cache):
+                if subscription_cache[uid][1] < time.time():
+                    subscription_cache.pop(uid, None)
+
+threading.Thread(target=cleanup_states, daemon=True, name="state-cleaner").start()
+
+def set_user_state(chat_id, **values):
+    values["_updated"] = time.monotonic()
+    with state_lock:
+        user_states[chat_id] = values
+
+def reset_user_state(chat_id):
+    set_user_state(chat_id, year=None, sem=None, material=None)
+
+def set_admin_state(user_id, **values):
+    values["_updated"] = time.monotonic()
+    with state_lock:
+        admin_states[user_id] = values
+
+def clear_admin_state(user_id):
+    with state_lock:
+        admin_states.pop(user_id, None)
+
+def escape_md_text(text):
+    return str(text).replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
+# ============================================================
+# STATIC COURSE CATALOG
+# This remains the source of truth for lecture names + File IDs.
+# To add/change/delete a lecture, edit the database below and redeploy.
+# To obtain a File ID: use the admin button "📎 استخراج File ID" and send the file.
+# ============================================================
+database = {'year_1_sem_1': [{'name': 'رياضيات1 📐', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'فيزيا ⚡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'تقانة 💻', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'خوارزميات 🧩', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'لغة1 🇬🇧', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'حماية بيئة 🌿', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'لغة عربية 📖', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}],
+            'year_1_sem_2': [{'name': 'رياضيات2 📐', 'content': {' المقرر كامل 📄': 'BQACAgQAAxkBAAISyWqkBxNVP9FhULNWxsMd1JAZXaPaAAJXJwAC8KEgUf2QgCapkZOGPQQ', 'ملف التمارين الهام  📄': 'BQACAgQAAxkBAAITT2qo-qbacggOcG-van2oylXFXFeaAAKnJwAC8KEgUcLSED5ivsjCPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'ميكانيك ⚙️', 'content': {'مقرر كامل 📄': 'BQACAgQAAxkBAAIOtGqdKyBeezocYUtVXHhDULWaWzCPAAIgJQACyZjYUDRABVPmiW0iPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'برمجة 💻', 'content': {'برمجة نظري 📄': 'BQACAgQAAxkBAAIOsGqdKoTRvXpOkmdzyoXAfBKyWai8AAKUHwACWH24UMSW_RHmBGYLPQQ', 'برمجة عملي  📄': 'BQACAgQAAxkBAAIOsmqdKr_TnzATC2p-7k8Q3FK4gk9qAAKVHwACWH24UI3OBlPAzSO3PQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'لغة2 🇬🇧', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAIKMmqTI84jkGbJC5fxdGfoHc4BQVpwAAIlHQACi-ohUs7uMgV_4xttPQQ', '📝 دورات سابقة': 'BQACAgQAAxkBAAIKNGqTI9eq2hpghJ4Hz6EUSOSXgj6WAAK8HAACIOEoUlA1QE3oHcC4PQQ'}}, 
+                             {'name': 'اسس كهربا 🔌', 'content': {'تجارب المخبر 📄': 'BQACAgQAAxkBAAIOumqdLJNTOGfaF5wwywKJGiHvmGkGAAIwJQACyZjYUJ3pW6Tcx1HcPQQ', 'المقرر كامل 📄': 'BQACAgQAAxkBAAIOuGqdLHb4thNX8PAs74WqgxtVv8f5AAIuJQACyZjYUH7TU6EiFxwQPQQ'}},
+                             {'name': 'صحة عامة 🏥', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAILBmqTtVV44UnTVNziyt5eGPEiS9MOAAI3GwACi-opUlPyu_XPA5P6PQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAILCGqTtWCLZ-OZXbP0azVHlVqoqeKQAAI8GwACi-opUoL3FQEJSgdXPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAILCmqTtWpCoN1hl10jb6IFCp7h5-pqAAJhGwACi-opUi-rIxtCrslIPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAILDGqTtZE0qctHfdmmd0mohFhuBVLyAAI5GwACi-opUkf8n5XUbQWdPQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAILDmqTtZsoAs_kCN2KwUHOZgZbCuH5AAI6GwACi-opUmHqmlpqR5JEPQQ', 'محاضرة 6 📄': 'BQACAgQAAxkBAAILEGqTtaL6wm_UNP3v9WbvxGUpdmCTAAI7GwACi-opUtsx3V-7tWYRPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAILCGqTtWCLZ-OZXbP0azVHlVqoqeKQAAI8GwACi-opUoL3FQEJSgdXPQQ', 'محاضرة 8 📄': 'BQACAgQAAxkBAAILE2qTtbi90VrAKzA8pocIPCfhDYm3AAI9GwACi-opUkh-wmkKxZzJPQQ', 'محاضرة 9 📄': 'BQACAgQAAxkBAAILFGqTtbgD6BEwSqY7OEZAK_UQ8a2IAAJiGwACi-opUiASFxjf4koBPQQ', 'محاضرة 10 📄': 'BQACAgQAAxkBAAILFWqTtbiXR5dgzJlaP35rZy3MfRmIAAK9HAACIOEoUty_CbP9uj8bPQQ', '📝 دورات سابقة': 'BQACAgQAAxkBAAILFWqTtbiXR5dgzJlaP35rZy3MfRmIAAK9HAACIOEoUty_CbP9uj8bPQQ'}}], 
+          
+             'year_2_sem_1': [{'name': 'رياضيات3 📐', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'الكترون ⚡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'oop 💻', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'تصميم 🧩', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'لغة3 🇬🇧', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': ' بني تحتية 🏥', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': ' اسس دارات 🔌', 'content': {'المقرر كامل  📄': 'PASTE_FILE_ID_HERE'}}],
+         
+            'year_2_sem_2': [{'name': 'رياضيات4 📐', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITUWqo-vO5d4F_KioZ5depsFiunZrcAAKQHwAChhcpUYIVdo3aF7gJPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITU2qo-wHdEBTF-V0oAgtJY4lK6tIyAAKRHwAChhcpUVTtg-2df6LTPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITVWqo_Twpe2mAo7o5sOA7-LjCkm9zAAKSHwAChhcpUbwYTzPFaNqJPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITV2qo_UtQwVo0dCQMjwdD_zHHizK5AAKTHwAChhcpUaX4ZEGy_0fUPQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAITWWqo_V8UBi9zSAXXKQAB5jLVSypegAAClB8AAoYXKVHjjew-CLbH5z0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAITe2qo_72U-7ysM4VPlc7CYVCazHoPAAJgHgACduVJUSm-ilOlYJ-sPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAITW2qo_Zxg9gZbtIq1sln_AjlgD0CvAAKWHwAChhcpUQg1y6oTGHKNPQQ', 'محاضرة 8 📄': 'BQACAgQAAxkBAAITXWqo_a-vbxhDxGZ-zYWTnNhrSdsBAAKXHwAChhcpUcpKxU4MBBx0PQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'تمثيلية ⚡', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITX2qo_jlfKiHf9MOr5-mc8SuR9kBzAAKEHwAChhcpUT-h0vtJS8prPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITYWqo_k5d--5C9P_OBPfxYLUy0OLwAAKFHwAChhcpUbGl5iAJlytnPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITY2qo_mJXxDvt387XnaToY2LvwaXzAAKGHwAChhcpUanetCSMxGh6PQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITZWqo_nPEQ_YrcTAqAAERKegtovtxAwAChx8AAoYXKVEBIoZcLYOcAz0E', 'محاضرة 5 📄': 'BQACAgQAAxkBAAITZ2qo_oOYs69tKmg1G1GM2F0Rr0VFAAKIHwAChhcpUW1Fo1aGlQ2bPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'اشارات 💻', 'content': {' المقرر كامل 📄': 'BQACAgQAAxkBAAITQGqo9CuuucVotC6-83v9x4WWH128AAKdHwAChhcpUYm-4_WDhjm5PQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'انتشار 🧩', 'content': {' المقرر كامل 📄': 'BQACAgQAAxkBAAITTWqo-eP3rSoM19Ck1upqzvyhMIcjAAKeHwAChhcpUUHco3oqcpGwPQQ','📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'لغة4 🇬🇧', 'content': {' المقرر كامل 📄': 'BQACAgQAAxkBAAITjWqpAazm3Bh1RYAl1EGhUjHvvJu4AAJjHgACduVJUfX66-9dBENYPQQ',' نوطة 📄': 'BQACAgQAAxkBAAITzmqpAsjtzuAd2gFPYimigImWhLT4AAJmHgACduVJUcPBRDx9k3iNPQQ', '📝 دورات سابقة': 'BQACAgQAAxkBAAITi2qpAYiwq4jQSvmiJ1f7xEz4iBFBAAJiHgACduVJUWVAHTEcxYNWPQQ'}}, 
+                             {'name': 'اقتصاد🌿', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITaWqo_uGULKFDztz8NFkKRTDwHo6UAAKfHwAChhcpUYhdlwZlmhFzPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITa2qo_yaDayBY2LQ42q9NAAHgdzeANgACoB8AAoYXKVEZC57VXjaIWT0E', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITbWqo_zjQ5yx42Th-xRx-3jAtQtCFAAKhHwAChhcpUdAHYD_ZTqsEPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITb2qo_0dNDrgEG8UP6c_p3fpeh9NdAAKiHwAChhcpUad9fMDINyeRPQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAITcWqo_11YzC9q0cGWBlCM4lY6L0VCAAKjHwAChhcpUc0WvYIE95AkPQQ', 'محاضرة 6 📄': 'BQACAgQAAxkBAAITc2qo_2tvDAo6o8ruAQABbOJdPR3DTgACpB8AAoYXKVGoe7GDPVMg2T0E', 'محاضرة 7 📄': 'BQACAgQAAxkBAAITdWqo_38meBEVoHAcaOs1b4Uz3NZ1AAKlHwAChhcpUQvgpLIFTC3sPQQ', 'محاضرة 8 📄': 'BQACAgQAAxkBAAITd2qo_42mwrjb-motj420kpnrw2mdAAKmHwAChhcpUTpPfry7Lu-FPQQ', 'محاضرة 9 📄': 'BQACAgQAAxkBAAITeWqo_5uLTH9dGcyjGu_BiGnol8gPAAKnHwAChhcpUTG7GVX9c-k-PQQ','📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'مضخمات 🔌', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITfWqo_9rMhdyctaAthLvkdxxx6GzTAAKJHwAChhcpUVCavaSgkTOOPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITf2qo_-pJ6DT0oevWxgy61f9xcXsbAAKKHwAChhcpUROulKSvUkAUPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITgWqo__rSeR1Kszaoe_6Nl8CHEum1AAKLHwAChhcpUckxkWYenxEPPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITg2qpAAEHAVZ_xKjguwY8D5CVtpSV3QACjB8AAoYXKVGVg_oo23ZmGT0E', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIThWqpAAEWGUVZFZLRI1WdUYr6KyweAQACjR8AAoYXKVF-mOFM7OkO_D0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAITh2qpAAEpTwlz7oEIsToIKtsmSRtxPwACjh8AAoYXKVFdar7Rm_AQhz0E', 'محاضرة 7 📄': 'BQACAgQAAxkBAAITiWqpAAE6Uh-NQIunoGraV0kM9NL7qgACjx8AAoYXKVGD3AIY70IICT0E', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}], 
+
+            
+            'year_3_sem_1': [{'name': 'قياسات 📏', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'دارات منطقية 🔢', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'معالجة اشارة 📡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'نظرية الاحتمالات 🎲', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'بنية حاسب 💻', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'دارات خطية ولا خطية 📈', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'اتصالات رقمية 🔢', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}], 
+            'year_3_sem_2': [{'name': 'ترميز - نظم معلومات 🔐', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAIS82qkD1V4dkXJ_PyY1X8KVmHhuy-GAAJXHQACzUH4UNZDOBKgdYR4PQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAIS9WqkD5CfrwNdWR4l_vOV4JGYfaNlAAJYHQACzUH4UIt6bjeaiAXzPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAIS92qkD6brXWkelE9Dp8_oKD-s0e7LAAJZHQACzUH4UBMjVjYUGBegPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAIS-WqkD8UDttyND_Uj7xNVKUEZMCe1AAJbHQACzUH4UJmFNy8wzIDsPQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIS-2qkD-xRAYIQPRqQJw2RXfyXIg9UAAJcHQACzUH4UBCdhQHTJCU1PQQ', 'محاضرة 6 📄': 'BQACAgQAAxkBAAIS_WqkD_yuwMPntJ3WbtY7W6M7EiplAAJdHQACzUH4UFLWVGTniaeGPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAIS_2qkEAu2GxX9cAS3Ig4THV-RsRN8AAJeHQACzUH4UMoQWwhTH39GPQQ', ' جلسة 1 عملي 📄': 'BQACAgQAAxkBAAITAWqkEKMR1zc_wc-bQWaERx5Y2-KPAAJfHQACzUH4UFvJX1DwdlNDPQQ', ' جلسة 2 عملي 📄': 'BQACAgQAAxkBAAITA2qkELCuxIWcpE0mRAjG3AZMCxfIAAJgHQACzUH4UPhOJ4GVL8OvPQQ', ' جلسة 3 عملي 📄': 'BQACAgQAAxkBAAITBWqkELwerZ_GVdZJEyaj03I_L1chAAJhHQACzUH4ULlGdIRuZdI2PQQ',  ' جلسة 4 عملي 📄': 'BQACAgQAAxkBAAITB2qkEM9Kc3i6ULl5o3oHB-UYYAYRAAJiHQACzUH4UI_wYcCWUmnjPQQ', ' جلسة 5 عملي 📄': 'BQACAgQAAxkBAAITCWqkEOQpBhe1G81Ha41MZsUIwWpgAAJjHQACzUH4UJj8PDVLtjvZPQQ', ' جلسة 6 عملي 📄': 'BQACAgQAAxkBAAITC2qkEPFqtZOOpDbsTtnquJw6Z_HTAAJkHQACzUH4UDElEcyll24ZPQQ',  ' جلسة 7 عملي 📄': 'BQACAgQAAxkBAAITDWqkEQABkrYMfKaIWc84t-yds_fQlgACZR0AAs1B-FB9utxI5DJ--z0E', ' جلسة 8 عملي 📄': 'BQACAgQAAxkBAAITD2qkEQ1ZTfLBx6K85RUUzYWqFGQYAAJmHQACzUH4UEEukQABYKaKYz0E', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'تحكم الي 🤖', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITEWqkFnJKop3CvJ_ER6uW4UQPHuMjAAJ8HwACzUEAAVGLkdEd-t56ZD0E', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITE2qkFptuG74KTrKWqaMhAZcWf2vpAAJ9HwACzUEAAVFFWN062L0bNT0E', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITFWqkFqiTrvLdBwYHebmDEh2Ru8jKAAJ_HwACzUEAAVGabC98XGvaIz0E', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITF2qkFrR7tAmfxF1_vR4TPruXVRgXAAJ-HwACzUEAAVFzb20vZOZjGD0E', 'محاضرة 5 📄': 'BQACAgQAAxkBAAITGWqkFspxGYO8Q3cJRGpHT18jC5PgAAKAHwACzUEAAVFVoprBVE_Yjj0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAITG2qkFtXQQKMi9Ui7YE39TzqsmBgOAAKBHwACzUEAAVGR7TSRHZJ9fD0E', ' جلسة 1 عملي 📄': 'BQACAgQAAxkBAAITHWqkF2GX8rxLarpACMHg_BCnXXFWAAKNHwACzUEAAVHfsLmhobeb6j0E', ' جلسة 2 عملي  📄': 'BQACAgQAAxkBAAITH2qkF6VhXz9kdaAB5nPNyJLZYumQAAKMHwACzUEAAVHM_k-5LhP_sz0E', ' جلسة 3 عملي  📄': 'BQACAgQAAxkBAAITIWqkF7RQ9DXIZnKfnAqA1V9Y9O07AAKOHwACzUEAAVGhXHHmwWWUpT0E', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'مكروية - هندسة امواج 🌊', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAIQD2qjL9BdAh-IS2bdXBtAkgrMHdWPAAJsHQACzUH4UAlUW0_suxlZPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAIQEWqjL-E5MeyNQOlEVb2hdeg4OshNAAJtHQACzUH4UL3prsn5TB6yPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAIQE2qjMBDmhX0xHX8SH-skseIIvASYAAJvHQACzUH4UOV0KcxiCbvfPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAIQFWqjMB_eVdTGbxco2yFNWHnq-HU_AAJwHQACzUH4UGfVvuiuT0h5PQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIQF2qjMDU0hyboYjBBGSz8aOuspBdeAAJxHQACzUH4UEoDlH_pnRpAPQQ', 'محاضرة 6 📄': 'BQACAgQAAxkBAAIQGWqjMEOWHS6jCwyIo1MQDqKKZNiLAAJyHQACzUH4UEmybKUFDYNaPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAIQG2qjMFJrxvOJ7mSPBwhRorvlhH7GAAJzHQACzUH4UKiu-26WZHWqPQQ', ' جلسة عملي 1 📄': 'BQACAgQAAxkBAAIRFmqjNnRwKNUfvpQyfF0feGm0cHUqAAJ2HQACzUH4UMoAAX9McK_Xdz0E', ' جلسة عملي 2 📄': 'BQACAgQAAxkBAAIRGGqjNrOcTIY7N1wAAeexSLpOnf54kAACdx0AAs1B-FB8Ysy79aS30D0E', ' جلسة عملي 3 📄': 'BQACAgQAAxkBAAIRGmqjNuOWcWg-ZpqKPyj95K5IVtVwAAJ4HQACzUH4UPnke6qI5zYdPQQ',  ' جلسة عملي 4 📄': 'BQACAgQAAxkBAAIRHGqjNxhqIngOXdkhKXOHmiUWrUSfAAJ5HQACzUH4UNzBikJX7e0dPQQ',  ' جلسة عملي 5+6 📄': 'BQACAgQAAxkBAAIQHWqjMUlxD_6IZg34FuqJe9TW7SZSAAJ7HQACzUH4UAVfM8hwegdiPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},     
+                             {'name': 'دارات متكاملة 🔲', 'content': {'محاضرة 2+1 📄': 'BQACAgQAAxkBAAIPumqihZ9DAyGKcsGp1GK5wdMSAAHIYgAC2B4AAv2JGFHUODXIQZjO1z0E', 'محاضرة 3 📄': 'BQACAgQAAxkBAAIPvGqihg7yLSEYhfktQc21tdS50_jbAAI2HQACzUH4ULumym5ptRI3PQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAIPvmqihhi4Q_E739mJXbwLawNX_FosAAI3HQACzUH4UAGHQbaRKThLPQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIPwGqihiHLCu4LIUDohkxeZgAB6h86WAACOB0AAs1B-FCcCjstU5bCtT0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAIPwmqihihS4dk_-N83NviilqDc-b5KAAI-HgAClLJwUkFStBL6iOHGPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAIPxGqihi7ymlHXdFGPARioGgABxtlPgwACLh4AAnf9SVITQzFTkFNS0z0E', 'محاضرة 8 📄': 'BQACAgQAAxkBAAIPxmqihjWYqWMxLV1GcptdB4Xk3Y1eAAIvHgACd_1JUgABqA3fjCEtqj0E', 'محاضرة 9 📄': 'BQACAgQAAxkBAAIPyGqihjqB3a4KnwIhIs3Zo8hCQ-hPAAIwHgACd_1JUny-7Jb30bMZPQQ', 'محاضرة 10 📄': 'BQACAgQAAxkBAAIPymqihj_2525DbZRs8nqNZPNixpARAAIxHgACd_1JUr5OoNs89qn0PQQ', ' ملف التمارين 📄': 'BQACAgQAAxkBAAIPzGqihkWii14uJv9khWb1H91NrkNDAAI5HQACzUH4UKOwzgaaoPGiPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},                             
+                             {'name': 'معالجة ومتحكمات 🎛️', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAIQI2qjMjXEEPnU8gsUL8mmbjnHJbHRAAJUHgACzUH4UGRsL6lMKH6QPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAIQJWqjMk2f_dYlOJ12SKfBqOMPZDkrAAJWHgACzUH4UEOxrzykZyQSPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAIQJ2qjMmipGdBHLcnwFm6hJ7J37eAGAAJOHwACzUEAAVGIILr5NRVU0z0E', 'محاضرة 4 📄': 'BQACAgQAAxkBAAIQKWqjMnlBV1uTOnqtksHn6_XRvUEjAAJPHwACzUEAAVENPdw5J_2e0T0E', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIQK2qjMo6VjjgO4A0jOwpFbYnKl5vrAAJQHwACzUEAAVF5yjHGNs96yz0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAIQLWqjMqPF_v8g_6a7fOvy1ASsY0pPAAJRHwACzUEAAVE4ls--6WPOBz0E', 'محاضرة 7 📄': 'BQACAgQAAxkBAAIQL2qjMrETk6RinkDNV6bwmYCpKrHgAAJSHwACzUEAAVEWB2gyfkUJ3D0E', 'محاضرة 8 📄': 'BQACAgQAAxkBAAIQMWqjMr99J6HFokVTwK1cqpBTvviNAAJTHwACzUEAAVHx0qV9-ctb_D0E' ,  ' جلسة عملي 1 📄': 'BQACAgQAAxkBAAIRIGqjOGbgTvM4ygMEqJhc9_6rW4e8AAJUHwACzUEAAVGgOUh5Ha8Hyz0E', ' جلسة عملي 2 📄': 'BQACAgQAAxkBAAIRImqjOIeWtypEkXSCmfxx4Nj6wTb4AAJVHwACzUEAAVH8VxDW0SuFPT0E',  ' جلسة عملي 3 📄': 'BQACAgQAAxkBAAIRJGqjOLyn19WIL9YO2JBCNB1gjT7yAAJXHwACzUEAAVH8zqyLS-Gnzj0E',  ' جلسة عملي 4 📄': 'BQACAgQAAxkBAAIRJmqjOMyobsNeBjTMppe2ZHBdFvIDAAJZHwACzUEAAVHAOiPHql96Ez0E', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},                         
+                             {'name': 'تراسل معطيات 📲', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAITI2qkGRQS_zklxyxZUojP2ne60spqAAKCHwACzUEAAVGeYIU7DRUG3j0E', 'محاضرة 2 📄': 'BQACAgQAAxkBAAITJWqkGSIStJwnq0OO4hSUMPiZoamkAAKDHwACzUEAAVEdIygPITAliD0E', 'محاضرة 3 📄': 'BQACAgQAAxkBAAITJ2qkGS_lJppGI_3Rk36FD-mH-l1rAAKEHwACzUEAAVGIkpc3v_FOOT0E', 'محاضرة 4 📄': 'BQACAgQAAxkBAAITKWqkGVxsAsjotW-MFCuEtocENAocAAKFHwACzUEAAVFbdtz8ugSy8T0E', 'محاضرة 5 📄': 'BQACAgQAAxkBAAITK2qkGXBSOAk3G6nRGKA-1r1mihDoAAKGHwACzUEAAVGn6j1I4sgysT0E', 'محاضرة 6 📄': 'BQACAgQAAxkBAAITLWqkGYsProIX43HlZaSYTOxJ_R5mAAKHHwACzUEAAVHPWJQdDLoVLD0E', 'محاضرة 7 📄': 'BQACAgQAAxkBAAITL2qkGa7tiTiktSab3-zUIMQr2hOXAAKIHwACzUEAAVGyr-duddIAAf09BA', 'محاضرة 8 📄': 'BQACAgQAAxkBAAITMWqkGb3Gaix0HUAo6Nc3D5jFvQyZAAKJHwACzUEAAVGyIdlKG_HMGj0E', 'محاضرة 9 📄': 'BQACAgQAAxkBAAITM2qkGcvA8ND_Mozdc0Oi3OD8LGbdAAKKHwACzUEAAVHBjY3nwMlj5z0E', 'محاضرة 10 📄': 'BQACAgQAAxkBAAITNWqkGdpM4T-QPEX1T4BCWk-gvhPAAAKLHwACzUEAAVG8vn3CGweQ7D0E', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'الرسم باستخدام الحاسب 🎨', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAIP-2qjLcxAdQUBBU6eZk6eioXAZWeIAAI9HQACzUH4UFuopZBPJEP8PQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAIP_WqjLdUbzMpdWKwoQ7evCF_2zL9IAAI-HQACzUH4UKR177Ilq0JMPQQ', 'محاضرة 3 📄': 'BQACAgQAAxkBAAIP_2qjLd5qjbD6zfXXVwlIq2wxAbBAAAI_HQACzUH4UIiXGkwK12oYPQQ', 'محاضرة 4 📄': 'BQACAgQAAxkBAAIQAWqjLjansUiJ9HgutYIojHqRuJ4wAAJAHQACzUH4UPo9r1kQ7aF8PQQ', 'محاضرة 5 📄': 'BQACAgQAAxkBAAIQA2qjLkh8J6Xl72WL3Can6MEVciOAAAJBHQACzUH4UNS16KGWCWvGPQQ', 'محاضرة 6 📄': 'BQACAgQAAxkBAAIQBWqjLljQeg3XNn8IQcnIzU6mQEolAAJCHQACzUH4UAMcpotXpkEzPQQ', 'محاضرة 7 📄': 'BQACAgQAAxkBAAIQCWqjLooAAWWYBEZiXWltZp7eP1UD_gACQx0AAs1B-FC6gMeKI8q6Jz0E', 'محاضرة 8 📄': 'BQACAgQAAxkBAAIQB2qjLmivPLYDOpavD6YHb75aHXscAAJEHQACzUH4UAWb5PUxX1H9PQQ',  ' جلسة عملي 1 📄': 'BQACAgQAAxkBAAIRNmqjOX7-AVxADXlkVosHvaWSzetSAAIPHwACxgthUW7dCfpjJxmzPQQ', ' جلسة عملي 2 📄': 'BQACAgQAAxkBAAIROGqjOcCIcz6w79ekijY2tZic6zhrAAIQHwACxgthUV9xTA81QzKGPQQ',  ' جلسة عملي 3 📄': 'BQACAgQAAxkBAAIROmqjOc_midjvDGD1ZOSmMOe61tMUAAIRHwACxgthUY4yLBNvYeRpPQQ',  ' جلسة عملي 4 📄': 'BQACAgQAAxkBAAIRPGqjOeh7JXhUfV7ZE2fBBJldkYcQAAISHwACxgthUXY_y-dpotbmPQQ', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}],
+            'year_4_sem_1': [{'name': 'تلفزيون 📺', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'رادار و سونار 🛰️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'شبكات 🌐', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'نمذجة 📊', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'هوائيات 📡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'مقاسم 📞', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}],
+            'year_4_sem_2': [{'name': 'معالجة اشارة 📶', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'تقانة الانترنت 🌐', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'بروتوكلات الانترنت 🔌', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'اتصالات ضوئية 💡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'كهرصوت - تطبيقات امواج 🔊', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'خليوي 1 📱', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'تدريب ميداني 🛠️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}], 
+            'year_5_sem_1': [{'name': 'امن الشبكات 🛡️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'دارات مكروية 🔬', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'خليوي 2 📱', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'تصميم شبكات 📐', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'تقانات ثانوية ⚡', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'مخبر شبكات 💻', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}], 
+            'year_5_sem_2': [{'name': 'حساسات - شبكات لاسلكية 📟', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
+                             {'name': 'برمجة وادارة الشبكات ⚙️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'الوثوقية والمعايرة ⚖️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'ذكاء اصطناعي 🧠', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'اتصالات فضائية 🚀', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'تطبيقات برمجية 🖥️', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}]}
+
+# ============================================================
+# CATALOG HELPERS
+# ============================================================
+def catalog_materials(db_key):
+    return database.get(db_key, [])
+
+def find_material(db_key, material_name):
+    return next((m for m in catalog_materials(db_key) if m["name"] == material_name), None)
+
+def find_file_id(db_key, material_name, lecture_name):
+    mat = find_material(db_key, material_name)
+    if not mat:
+        return None
+
+    content = mat.get("content", {})
+    # نبحث بالاسم كما هو أولاً، ثم نتجاهل المسافات الزائدة.
+    value = content.get(lecture_name)
+    if value is None:
+        wanted = lecture_name.strip()
+        for key, candidate in content.items():
+            if key.strip() == wanted:
+                value = candidate
+                break
+
+    if value in (None, "", "PASTE_FILE_ID_HERE", "ضع_هنا_file_id"):
+        return None
+    return value
+
+def catalog_search(query, limit=15):
+    q = query.casefold().strip()
+    results = []
+    for db_key, materials in database.items():
+        for mat in materials:
+            for lecture, file_id in mat.get("content", {}).items():
+                if q in mat["name"].casefold() or q in lecture.casefold():
+                    if file_id not in (None, "", "PASTE_FILE_ID_HERE", "ضع_هنا_file_id"):
+                        results.append((db_key, mat["name"], lecture))
+                        if len(results) >= limit:
+                            return results
+    return results
+
+def code_snippet(db_key, material, lecture, file_id=None):
+    value = file_id or "PASTE_FILE_ID_HERE"
+    return f'"{lecture}": "{value}"'
+
+def find_catalog_location(material_name, lecture_name):
+    matches = []
+    for db_key, materials in database.items():
+        for mat in materials:
+            if mat["name"] == material_name and lecture_name in mat.get("content", {}):
+                matches.append(db_key)
+    return matches
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+def get_years_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("السنة الأولى 1️⃣", "السنة الثانية 2️⃣")
+    markup.row("السنة الثالثة 3️⃣", "السنة الرابعة 4️⃣")
+    markup.row("السنة الخامسة 5️⃣")
+    markup.row("💬 أرسل ملاحظة/استفسار", "📅 برنامج الاسبوع")
+    return markup
+
+def get_semesters_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("الفصل الأول 📘", "الفصل الثاني 📙")
+    markup.row("🏠 العودة للرئيسية")
+    return markup
+
+def get_materials_keyboard(materials_list):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    row = []
+    for item in materials_list:
+        row.append(KeyboardButton(item["name"]))
+        if len(row) == 2:
+            markup.row(*row); row = []
+    if row: markup.row(*row)
+    markup.row("🔙 رجوع للفصول", "🏠 العودة للرئيسية")
+    return markup
+
+def get_content_keyboard(content_dict, db_key, material_name, user_id):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    row = []
+    for key, value in content_dict.items():
+        if key == "📝 دورات سابقة":
+            continue
+        row.append(KeyboardButton(key))
+        if len(row) == 2:
+            markup.row(*row); row = []
+    if row: markup.row(*row)
+    if "📝 دورات سابقة" in content_dict:
+        markup.row("📝 دورات سابقة")
+    markup.row("🔙 رجوع للمواد", "🏠 العودة للرئيسية")
+    return markup
+
 def get_admin_keyboard():
-  markup = types.InlineKeyboardMarkup(row_width=2)
-  btn_stats = types.InlineKeyboardButton(
-      text='📊 الإحصائيات التفصيلية', callback_data='admin_stats'
-  )
-  btn_archive = types.InlineKeyboardButton(
-      text='📁 أرشيف ومجلدات الطلاب', callback_data='admin_archive'
-  )
-  btn_search = types.InlineKeyboardButton(
-      text='🔍 البحث عن طالب', callback_data='admin_search'
-  )
-  btn_export = types.InlineKeyboardButton(
-      text='📥 تنزيل تقرير Excel', callback_data='admin_export'
-  )
-  btn_reset = types.InlineKeyboardButton(
-      text='🔓 فك قفل طالب', callback_data='admin_reset'
-  )
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📊 إحصائيات البوت", "📢 إرسال إذاعة")
+    markup.row("📎 استخراج File ID", "🧾 تجهيز سطر ملف")
+    markup.row("🗑️ تجهيز حذف من الكود", "📸 برنامج الاسبوع")
+    markup.row("📦 نسخة احتياطية", "🚫 حظر / إلغاء حظر مستخدم")
+    markup.row("📜 سجل الإدارة", "🏠 العودة للرئيسية")
+    return markup
 
-  markup.add(btn_stats, btn_archive)
-  markup.add(btn_search, btn_export)
-  markup.add(btn_reset)
-  return markup
+def get_sub_inline_markup():
+    markup = InlineKeyboardMarkup()
+    clean_username = CHANNEL_USERNAME.lstrip("@")
+    markup.add(InlineKeyboardButton("📢 رابط القناة", url=f"https://t.me/{clean_username}"))
+    markup.add(InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription"))
+    return markup
 
-
-@bot.message_handler(commands=['admin'])
-def admin_command(message):
-  if not is_admin(message.from_user.id):
-    bot.reply_to(message, '⚠️ عذراً، هذه اللوحة مخصصة لرئيس الهيئة/الأدمن فقط.')
-    return
-
-  text = (
-      '🛠️ لوحة تحكم رئيس الهيئة المباشرة (Admin Panel)\n\n'
-      'مرحباً بك! جميع الطلبات تصلك هنا في محادثتك المباشرة.\n'
-      'يمكنك استعراض الأرشيف، الإحصائيات، والبحث عن أي طالب عبر الأزرار أدناه:'
-  )
-  bot.send_message(message.chat.id, text, reply_markup=get_admin_keyboard())
-
-
-# ==================== التفاعل مع أزرار لوحة الأدمن ====================
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
-def handle_admin_panel_callbacks(call):
-  if not is_admin(call.from_user.id):
-    bot.answer_callback_query(call.id, '⚠️ غير مصرح لك.', show_alert=True)
-    return
-
-  action = call.data
-
-  if action == 'admin_stats':
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM freshmen')
-    total = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM freshmen WHERE status = 'approved'")
-    approved = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM freshmen WHERE status = 'pending'")
-    pending = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM freshmen WHERE status = 'rejected'")
-    rejected = cursor.fetchone()[0]
-    conn.close()
-
-    text = (
-        f'📊 إحصائيات توثيق المستجدين التفصيلية:\n\n'
-        f'👥 إجمالي المتقدمين: {total}\n'
-        f'✅ الطلبات المقبولة: {approved}\n'
-        f'⏳ الطلبات المعلقة: {pending}\n'
-        f'❌ الطلبات المرفوضة: {rejected}\n'
-    )
-    bot.send_message(
-        call.message.chat.id, text, reply_markup=get_admin_keyboard()
-    )
-    bot.answer_callback_query(call.id)
-
-  elif action == 'admin_archive':
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT telegram_id, full_name, status, created_at FROM freshmen ORDER'
-        ' BY created_at DESC LIMIT 10'
-    )
-    students = cursor.fetchall()
-    conn.close()
-
-    if not students:
-      bot.send_message(
-          call.message.chat.id, '📁 الأرشيف فارغ حالياً، لا يوجد طلاب.'
-      )
-      bot.answer_callback_query(call.id)
-      return
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for tid, name, status, created_at in students:
-      status_icon = (
-          '✅' if status == 'approved' else ('⏳' if status == 'pending' else '❌')
-      )
-      btn = types.InlineKeyboardButton(
-          text=f'{status_icon} {name} ({created_at[:10]})',
-          callback_data=f'view_file_{tid}',
-      )
-      markup.add(btn)
-
-    bot.send_message(
-        call.message.chat.id,
-        '📁 سجلات وأرشيف أحدث الطلاب (اضغط على اسم الطالب لفتح مجلده وصوره):',
-        reply_markup=markup,
-    )
-    bot.answer_callback_query(call.id)
-
-  elif action == 'admin_search':
-    admin_input_states[call.from_user.id] = 'awaiting_search'
-    bot.send_message(
-        call.message.chat.id,
-        '🔍 يرجى كتابة رقم هاتف الطالب أو Telegram ID الخاص به للبحث:',
-    )
-    bot.answer_callback_query(call.id)
-
-  elif action == 'admin_export':
-    bot.answer_callback_query(call.id, '⏳ جاري استخراج تقرير Excel...')
-    conn = db_connect()
-    df = pd.read_sql_query('SELECT * FROM freshmen', conn)
-    conn.close()
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-      df.to_excel(writer, index=False, sheet_name='Freshmen_Data')
-    output.seek(0)
-
-    bot.send_document(
-        call.message.chat.id,
-        document=types.InputFile(
-            output, file_name='Freshmen_Students_Report.xlsx'
-        ),
-        caption='📊 تقرير الطلاب المستجدين وحالات التوثيق',
-    )
-
-  elif action == 'admin_reset':
-    admin_input_states[call.from_user.id] = 'awaiting_reset'
-    bot.send_message(
-        call.message.chat.id,
-        '🔓 أرسل رقم هاتف الطالب أو Telegram ID لفك القفل عنه:',
-    )
-    bot.answer_callback_query(call.id)
-
-
-# ==================== عرض مجلد الطالب كاملاً بالصور للأدمن ====================
-@bot.callback_query_handler(func=lambda call: call.data.startswith('view_file_'))
-def handle_view_student_file(call):
-  if not is_admin(call.from_user.id):
-    return
-
-  target_user_id = int(call.data.split('_')[2])
-  conn = db_connect()
-  cursor = conn.cursor()
-  cursor.execute(
-      'SELECT full_name, phone, admission_photo_id, id_photo_id, status,'
-      ' created_at FROM freshmen WHERE telegram_id = ?',
-      (target_user_id,),
-  )
-  student = cursor.fetchone()
-  conn.close()
-
-  if not student:
-    bot.answer_callback_query(call.id, '❌ سجل الطالب غير موجود.')
-    return
-
-  full_name, phone, adm_photo, id_photo, status, created_at = student
-
-  status_str = (
-      '✅ مقبول'
-      if status == 'approved'
-      else ('⏳ قيد المراجعة' if status == 'pending' else '❌ مرفوض')
-  )
-
-  info_text = (
-      f'📁 مجلد الطالب الرقمي:\n\n'
-      f'👤 الاسم الثلاثي: {full_name}\n'
-      f'📱 رقم الهاتف: {phone}\n'
-      f'🆔 Telegram ID: {target_user_id}\n'
-      f'📌 حالة التوثيق: {status_str}\n'
-      f'🕒 تاريخ التقديم: {created_at}'
-  )
-  bot.send_message(call.message.chat.id, info_text)
-
-  if adm_photo:
+def check_sub(user_id, force=False):
+    now = time.time()
+    cached = subscription_cache.get(user_id)
+    if cached and not force and cached[1] > now:
+        return cached[0]
     try:
-      bot.send_photo(
-          call.message.chat.id,
-          adm_photo,
-          caption=f'📄 صورة المفاضلة للطالب: {full_name}',
-      )
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        ok = member.status in ["creator", "administrator", "member", "restricted"]
+        subscription_cache[user_id] = (ok, now + SUB_CACHE_SECONDS)
+        return ok
     except Exception:
-      pass
+        logger.exception("Subscription check failed")
+        return False
 
-  if id_photo:
+def require_private(message):
+    if message.chat.type != "private":
+        try:
+            bot.reply_to(message, "ℹ️ استخدم البوت في المحادثة الخاصة فقط.")
+        except Exception:
+            pass
+        return False
+    return True
+
+# ============================================================
+# PERSISTENT USER FEATURES
+# ============================================================
+def record_download(user_id, db_key, material, lecture):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO downloads(user_id,db_key,material_name,lecture_name) VALUES(?,?,?,?)",
+                     (user_id, db_key, material, lecture))
+        conn.execute("""INSERT INTO recent_views(user_id,db_key,material_name,lecture_name)
+                       VALUES(?,?,?,?) ON CONFLICT(user_id,db_key,material_name,lecture_name)
+                       DO UPDATE SET viewed_at=CURRENT_TIMESTAMP""", (user_id, db_key, material, lecture))
+
+def toggle_favorite(user_id, db_key, material, lecture):
+    with db_connect() as conn:
+        exists = conn.execute("SELECT 1 FROM favorites WHERE user_id=? AND db_key=? AND material_name=? AND lecture_name=?",
+                              (user_id, db_key, material, lecture)).fetchone()
+        if exists:
+            conn.execute("DELETE FROM favorites WHERE user_id=? AND db_key=? AND material_name=? AND lecture_name=?",
+                         (user_id, db_key, material, lecture))
+            return False
+        conn.execute("INSERT INTO favorites(user_id,db_key,material_name,lecture_name) VALUES(?,?,?,?)",
+                     (user_id, db_key, material, lecture))
+        return True
+
+def get_favorites(user_id, limit=30):
+    with db_connect() as conn:
+        return conn.execute("SELECT db_key,material_name,lecture_name FROM favorites WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                            (user_id, limit)).fetchall()
+
+def get_recent(user_id, limit=10):
+    with db_connect() as conn:
+        return conn.execute("SELECT db_key,material_name,lecture_name FROM recent_views WHERE user_id=? ORDER BY viewed_at DESC LIMIT ?",
+                            (user_id, limit)).fetchall()
+
+def get_stats():
+    with db_connect() as conn:
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE last_seen >= datetime('now','-7 day')").fetchone()[0]
+        downloads = conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0]
+        favs = conn.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
+        banned = conn.execute("SELECT COUNT(*) FROM banned_users").fetchone()[0]
+        top = conn.execute("""SELECT material_name, lecture_name, COUNT(*) c FROM downloads
+                            GROUP BY material_name, lecture_name ORDER BY c DESC LIMIT 5""").fetchall()
+        return users, active, downloads, favs, banned, top
+
+# ============================================================
+# ADMIN BROADCAST (persistent job + safe pacing)
+# ============================================================
+def run_broadcast(job_id, admin_id, text, users):
+    success = failed = 0
+    for uid in users:
+        try:
+            bot.send_message(uid, text)
+            success += 1
+        except Exception as exc:
+            failed += 1
+            msg = str(exc).lower()
+            if "blocked" in msg or "forbidden" in msg or "chat not found" in msg:
+                mark_user_inactive(uid)
+        # Conservative pacing; do not try to bypass Telegram limits.
+        time.sleep(0.08)
+        if success % 50 == 0 and success:
+            with db_connect() as conn:
+                conn.execute("UPDATE broadcast_jobs SET success=?, failed=? WHERE id=?", (success, failed, job_id))
+    with db_connect() as conn:
+        conn.execute("UPDATE broadcast_jobs SET status='completed',success=?,failed=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (success, failed, job_id))
+    audit(admin_id, "broadcast_completed", job_id, f"success={success}, failed={failed}")
     try:
-      markup = types.InlineKeyboardMarkup(row_width=2)
-      btn_approve = types.InlineKeyboardButton(
-          text='✅ قبول وتوليد الرابط', callback_data=f'approve_{target_user_id}'
-      )
-      btn_reject = types.InlineKeyboardButton(
-          text='❌ رفض الطلب', callback_data=f'reject_menu_{target_user_id}'
-      )
-      markup.add(btn_approve, btn_reject)
-
-      bot.send_photo(
-          call.message.chat.id,
-          id_photo,
-          caption=f'🪪 صورة الهوية للطالب: {full_name}',
-          reply_markup=markup,
-      )
+        bot.send_message(admin_id, f"✅ اكتملت الإذاعة\n• الإجمالي: {len(users)}\n• نجاح: {success}\n• فشل: {failed}")
     except Exception:
-      pass
-
-  bot.answer_callback_query(call.id)
-
-
-# ==================== استقبال مدخلات البحث وفك القفل من الأدمن ====================
-@bot.message_handler(
-    func=lambda msg: is_admin(msg.from_user.id)
-    and msg.from_user.id in admin_input_states
-)
-def handle_admin_search_and_reset(message):
-  state = admin_input_states.get(message.from_user.id)
-  query = message.text.strip()
-
-  if state == 'awaiting_search':
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT telegram_id, full_name, phone, status, created_at FROM freshmen'
-        ' WHERE phone LIKE ? OR telegram_id LIKE ? OR full_name LIKE ?',
-        (f'%{query}%', f'%{query}%', f'%{query}%'),
-    )
-    results = cursor.fetchall()
-    conn.close()
-
-    if not results:
-      bot.reply_to(message, '❌ لم يتم العثور على أي طالب مطابق للبحث.')
-    else:
-      markup = types.InlineKeyboardMarkup()
-      for tid, name, phone, status, created_at in results:
-        btn = types.InlineKeyboardButton(
-            text=f'📁 {name} ({phone})', callback_data=f'view_file_{tid}'
-        )
-        markup.add(btn)
-      bot.reply_to(
-          message,
-          f'🔍 نتائج البحث عن ({query}):\nاضغط على الطالب للفتح:',
-          reply_markup=markup,
-      )
-
-    del admin_input_states[message.from_user.id]
-
-  elif state == 'awaiting_reset':
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE freshmen SET status = 'reset' WHERE phone = ? OR telegram_id ="
-        ' ?',
-        (query, query),
-    )
-
-    if cursor.rowcount > 0:
-      conn.commit()
-      bot.reply_to(message, f'✅ تم فك القفل عن حساب الطالب ({query}) بنجاح.')
-    else:
-      bot.reply_to(message, '❌ لم يتم العثور على الطالب.')
-    conn.close()
-
-    del admin_input_states[message.from_user.id]
-
-
-# ==================== بدء التسجيل للمستجدين (/start) ====================
-def begin_registration_flow(user_id, chat_id):
-  """المنطق المشترك لبدء أو استئناف التسجيل، يستقبل user_id و chat_id
-  بشكل صريح حتى يشتغل صحيح سواء استُدعي من /start أو من زر (retry)."""
-  conn = db_connect()
-  cursor = conn.cursor()
-  cursor.execute(
-      'SELECT status, full_name FROM freshmen WHERE telegram_id = ?', (user_id,)
-  )
-  user = cursor.fetchone()
-  conn.close()
-
-  if user:
-    status, full_name = user
-    if status == 'approved':
-      bot.send_message(
-          chat_id,
-          f'🎉 أهلاً بك مجدداً يا {full_name}!\n\nلقد تم توثيق حسابك مسبقاً'
-          ' واستلام روابط السنة الأولى.',
-      )
-      return
-    elif status == 'pending':
-      bot.send_message(
-          chat_id,
-          '⏳ طلبك قيد المراجعة حالياً من قبل الهيئة.\n\nيرجى الانتظار، وسيصلك'
-          ' رابط الانضمام هنا فور التدقيق والقبول.',
-      )
-      return
-
-  user_sessions[user_id] = {'step': 'NAME'}
-
-  welcome_text = (
-      '🎓 أهلاً بك في بوت توثيق الطلاب المستجدين (قسم الهندسة الإلكترونية'
-      ' والاتصالات - الهمك)\n'
-      '( بَرمَجَ هذا البوت @Youssef_Sabra)\n\n'
-      'للانضمام لقناة ومجموعة السنة الأولى، يرجى إكمال خطوات التوثيق للتأكد'
-      ' من قبولك بالقسم.\n\n'
-      '✍️ الخطوة (1/4): يرجى كتابة اسمك الثلاثي الكامل:'
-  )
-  bot.send_message(
-      chat_id, welcome_text, reply_markup=types.ReplyKeyboardRemove()
-  )
-
-
-@bot.message_handler(commands=['start'])
-def start_freshman(message):
-  user_id = message.from_user.id
-
-  if is_admin(user_id):
-    admin_command(message)
-    return
-
-  begin_registration_flow(user_id, message.chat.id)
-
-
-# ==================== خطوات إدخال البيانات والصور من الطالب ====================
-@bot.message_handler(
-    func=lambda msg: msg.from_user.id in user_sessions
-    and user_sessions[msg.from_user.id]['step'] == 'NAME'
-)
-def handle_name(message):
-  user_id = message.from_user.id
-  full_name = message.text.strip()
-
-  user_sessions[user_id]['name'] = full_name
-  user_sessions[user_id]['step'] = 'PHONE'
-
-  markup = types.ReplyKeyboardMarkup(
-      row_width=1, resize_keyboard=True, one_time_keyboard=True
-  )
-  button = types.KeyboardButton(
-      text='📱 مشاركة رقم الهاتف لتأكيد الهوية', request_contact=True
-  )
-  markup.add(button)
-
-  bot.send_message(
-      message.chat.id,
-      f'أهلاً بك يا {full_name}! 👋\n\n'
-      '📱 الخطوة (2/4): يرجى الضغط على الزر أدناه لمشاركة رقم هاتفك المعتمد:',
-      reply_markup=markup,
-  )
-
-
-@bot.message_handler(
-    content_types=['contact'],
-    func=lambda msg: msg.from_user.id in user_sessions
-    and user_sessions[msg.from_user.id]['step'] == 'PHONE',
-)
-def handle_phone(message):
-  if not message.contact:
-    return
-
-  user_id = message.from_user.id
-
-  if message.contact.user_id != user_id:
-    bot.send_message(
-        message.chat.id,
-        '⚠️ تنبيه: يرجى مشاركة رقم الهاتف الخاص بحسابك الحالي حصراً بالضغط على'
-        ' الزر.',
-    )
-    return
-
-  raw_phone = message.contact.phone_number
-  phone = clean_phone(raw_phone)
-
-  user_sessions[user_id]['phone'] = phone
-  user_sessions[user_id]['step'] = 'ADMISSION_PHOTO'
-
-  bot.send_message(
-      message.chat.id,
-      '✅ تم التحقق من رقم الهاتف بنجاح!\n\n'
-      '📄 الخطوة (3/4): يرجى إرسال صورة بطاقة المفاضلة (التي تظهر اسمك وقبولك في'
-      ' قسم الاتصالات):',
-      reply_markup=types.ReplyKeyboardRemove(),
-  )
-
-
-@bot.message_handler(
-    content_types=['photo'],
-    func=lambda msg: msg.from_user.id in user_sessions
-    and user_sessions[msg.from_user.id]['step'] == 'ADMISSION_PHOTO',
-)
-def handle_admission_photo(message):
-  user_id = message.from_user.id
-  photo_id = message.photo[-1].file_id
-
-  user_sessions[user_id]['admission_photo'] = photo_id
-  user_sessions[user_id]['step'] = 'ID_PHOTO'
-
-  bot.send_message(
-      message.chat.id,
-      '✅ تم استلام صورة المفاضلة بنجاح!\n\n'
-      '🪪 الخطوة (4/4) والأخيرة: يرجى إرسال صورة البطاقة الشخصية (الهوية):',
-  )
-
-
-@bot.message_handler(
-    content_types=['photo'],
-    func=lambda msg: msg.from_user.id in user_sessions
-    and user_sessions[msg.from_user.id]['step'] == 'ID_PHOTO',
-)
-def handle_id_photo(message):
-  user_id = message.from_user.id
-  id_photo_id = message.photo[-1].file_id
-
-  user_data = user_sessions[user_id]
-  full_name = user_data['name']
-  phone = user_data['phone']
-  admission_photo_id = user_data['admission_photo']
-
-  # 1. حفظ الطلب والمستندات في قاعدة البيانات
-  conn = db_connect()
-  cursor = conn.cursor()
-  cursor.execute(
-      """
-        INSERT INTO freshmen (telegram_id, full_name, phone, admission_photo_id, id_photo_id, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-        ON CONFLICT(telegram_id) DO UPDATE SET 
-            full_name = excluded.full_name, 
-            phone = excluded.phone, 
-            admission_photo_id = excluded.admission_photo_id, 
-            id_photo_id = excluded.id_photo_id, 
-            status = 'pending'
-    """,
-      (user_id, full_name, phone, admission_photo_id, id_photo_id),
-  )
-  conn.commit()
-  conn.close()
-
-  # 2. إعلام الطالب بالاستلام
-  bot.send_message(
-      message.chat.id,
-      '🚀 تم استلام بياناتك وأوراقك بنجاح!\n\n'
-      'طلبك الآن قيد المراجعة والتدقيق، وسيصلك إشعار بالقبول مع روابط القنوات'
-      ' فور الاعتماد.',
-  )
-
-  # 3. تحويل الصور والبيانات المباشرة لشات كل أدمن (نسخة لكل واحد فيهم)
-  username_str = (
-      f'@{message.from_user.username}'
-      if message.from_user.username
-      else 'لا يوجد'
-  )
-
-  markup = types.InlineKeyboardMarkup(row_width=2)
-  btn_approve = types.InlineKeyboardButton(
-      text='✅ قبول وتوليد الرابط', callback_data=f'approve_{user_id}'
-  )
-  btn_reject = types.InlineKeyboardButton(
-      text='❌ رفض الطلب', callback_data=f'reject_menu_{user_id}'
-  )
-  markup.add(btn_approve, btn_reject)
-
-  def send_to_admin(admin_id):
-    # إرسال الصورة الأولى (المفاضلة)
-    bot.send_photo(
-        admin_id,
-        admission_photo_id,
-        caption=(
-            f'📥 طلب توثيق مستجد جديد (1/2 - المفاضلة):\n\n'
-            f'👤 الاسم: {full_name}\n'
-            f'📱 الهاتف: {phone}\n'
-            f'🆔 Telegram ID: {user_id}\n'
-            f'👤 المعرف: {username_str}'
-        ),
-    )
-    # إرسال الصورة الثانية (الهوية) مع أزرار القبول والرفض المباشرة
-    bot.send_photo(
-        admin_id,
-        id_photo_id,
-        caption=f'🪪 (2/2 - صورة الهوية) للطالب: {full_name}\n👇 اتخذ القرار بضغطة زر:',
-        reply_markup=markup,
-    )
-
-  notify_all_admins(send_to_admin)
-
-  if user_id in user_sessions:
-    del user_sessions[user_id]
-
-
-# ==================== معالجة القبول والرفض التلقائي بضغطة زر ====================
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith(
-        ('approve_', 'reject_', 'retry_freshman')
-    )
-)
-def handle_admin_decision(call):
-  if not is_admin(call.from_user.id):
-    bot.answer_callback_query(call.id, '⚠️ غير مصرح لك.', show_alert=True)
-    return
-
-  data = call.data
-
-  if data == 'retry_freshman':
-    user_id = call.from_user.id
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE freshmen SET status = 'reset' WHERE telegram_id = ?", (user_id,)
-    )
-    conn.commit()
-    conn.close()
-
-    bot.answer_callback_query(call.id, '👍 تم فتح التسجيل مجدداً.')
-    begin_registration_flow(user_id, call.message.chat.id)
-    return
-
-  if data.startswith('approve_'):
-    target_user_id = int(data.split('_')[1])
-
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT full_name, phone, status FROM freshmen WHERE telegram_id = ?',
-        (target_user_id,),
-    )
-    st = cursor.fetchone()
-
-    if not st:
-      bot.answer_callback_query(call.id, '❌ لم يتم العثور على الطالب.')
-      conn.close()
-      return
-
-    full_name, phone, current_status = st
-
-    # حماية من التعارض: لو أدمن تاني سبقك وقبل/رفض هذا الطالب من نسخته
-    # الخاصة، ما نعيد تنفيذ العملية ولا نبعت روابط مكررة للطالب.
-    if current_status == 'approved':
-      bot.answer_callback_query(call.id, 'ℹ️ تم قبول هذا الطالب مسبقاً من أدمن آخر.', show_alert=True)
-      try:
-        bot.edit_message_caption(
-            caption=f'✅ تم قبول الطالب ({full_name} - {phone}) مسبقاً (من أدمن آخر).',
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
-      except Exception:
         pass
-      conn.close()
-      return
 
+def start_broadcast(admin_id, text):
+    users = get_all_users()
+    with db_connect() as conn:
+        cur = conn.execute("INSERT INTO broadcast_jobs(admin_id,content,status,total) VALUES(?,?,?,?)",
+                           (admin_id, text, "sending", len(users)))
+        job_id = cur.lastrowid
+    audit(admin_id, "broadcast_started", job_id, f"total={len(users)}")
+    threading.Thread(target=run_broadcast, args=(job_id, admin_id, text, users), daemon=True).start()
+    return len(users)
+
+# ============================================================
+# BACKUP
+# ============================================================
+BACKUP_TABLES = ["users", "banned_users", "settings", "audit_logs", "downloads",
+                 "favorites", "recent_views", "feedback", "broadcast_jobs"]
+
+def send_backup(chat_id):
+    # ما في ملف SQLite محلي بعد الانتقال لـ Turso، فنبني نسخة JSON من كل
+    # الجداول مباشرة من قاعدة البيانات السحابية ونرسلها كملف.
     try:
-      lectures_link = bot.create_chat_invite_link(
-          chat_id=FRESHMAN_LECTURES_ID, member_limit=1
-      ).invite_link
-      discussion_link = bot.create_chat_invite_link(
-          chat_id=FRESHMAN_DISCUSSION_ID, member_limit=1
-      ).invite_link
+        backup = {}
+        with db_connect() as conn:
+            for table in BACKUP_TABLES:
+                cur = conn.execute(f"SELECT * FROM {table}")
+                cols = [d[0] for d in cur.description]
+                backup[table] = [dict(zip(cols, row)) for row in cur.fetchall()]
 
-      cursor.execute(
-          "UPDATE freshmen SET status = 'approved' WHERE telegram_id = ?",
-          (target_user_id,),
-      )
-      conn.commit()
-
-      markup = types.InlineKeyboardMarkup(row_width=1)
-      btn1 = types.InlineKeyboardButton(
-          text='📚 الانضمام لقناة المحاضرات (سنة أولى)', url=lectures_link
-      )
-      btn2 = types.InlineKeyboardButton(
-          text='💬 الانضمام لمجموعة المناقشة (سنة أولى)', url=discussion_link
-      )
-      markup.add(btn1, btn2)
-
-      success_msg = (
-          f'🎉 مبارك قبولك وتوثيق حسابك يا {full_name}!\n\n'
-          f'أهلاً بك رسمياً في قسم الهندسة الإلكترونية والاتصالات 🎓\n'
-          f'ممثل الاتصالات : @Youssef_Sabra\n\n'
-          f'👇 إليك روابط الانضمام الخاصة بدفعتك (سنة أولى مستجدين):'
-      )
-      bot.send_message(target_user_id, success_msg, reply_markup=markup)
-
-      bot.edit_message_caption(
-          caption=(
-              f'✅ تم قبول الطالب ({full_name} - {phone}) بنجاح وإرسال الروابط'
-              ' له أوتوماتيكياً!'
-          ),
-          chat_id=call.message.chat.id,
-          message_id=call.message.message_id,
-      )
-
-    except Exception as e:
-      bot.send_message(
-          call.message.chat.id,
-          f'❌ تعذر إتمام العملية:\n{str(e)}\n\nتأكد أن البوت مشرف في'
-          ' القناتين ولديه صلاحية Invite Users.',
-      )
-
-    conn.close()
-
-  elif data.startswith('reject_menu_'):
-    target_user_id = int(data.split('_')[2])
-    markup = types.InlineKeyboardMarkup(row_width=1)
-
-    r1 = types.InlineKeyboardButton(
-        text='📷 الصورة غير واضحة',
-        callback_data=f'reject_reason_{target_user_id}_1',
-    )
-    r2 = types.InlineKeyboardButton(
-        text='📄 المفاضلة لا تحتوي قسم اتصالات',
-        callback_data=f'reject_reason_{target_user_id}_2',
-    )
-    r3 = types.InlineKeyboardButton(
-        text='🪪 صورة الهوية غير مطابقة',
-        callback_data=f'reject_reason_{target_user_id}_3',
-    )
-
-    markup.add(r1, r2, r3)
-    bot.edit_message_caption(
-        caption='📌 اختر سبب رفض الطلب ليتم إبلاغ الطالب تلقائياً:',
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=markup,
-    )
-
-  elif data.startswith('reject_reason_'):
-    parts = data.split('_')
-    target_user_id = int(parts[2])
-    reason_code = parts[3]
-
-    reasons = {
-        '1': '📷 الصور المرفقة غير واضحة، يرجى إعادة التصوير بشكل جلي والإرسال مجدداً.',
-        '2': '📄 بطاقة المفاضلة المرفقة لا توضح القبول في قسم الهندسة الإلكترونية والاتصالات.',
-        '3': '🪪 صورة الهوية الشخصية غير واضحة أو غير مطابقة للبيانات.',
-    }
-    selected_reason = reasons.get(reason_code, 'الصور غير مطابقة للشروط.')
-
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT status FROM freshmen WHERE telegram_id = ?', (target_user_id,)
-    )
-    row = cursor.fetchone()
-
-    # نفس حماية التعارض: تفادي رفض/إشعار مكرر لو أدمن تاني تصرف بالطلب قبلك.
-    if row and row[0] in ('approved', 'rejected'):
-      bot.answer_callback_query(call.id, 'ℹ️ تم التعامل مع هذا الطلب مسبقاً من أدمن آخر.', show_alert=True)
-      conn.close()
-      return
-
-    cursor.execute(
-        "UPDATE freshmen SET status = 'rejected' WHERE telegram_id = ?",
-        (target_user_id,),
-    )
-    conn.commit()
-    conn.close()
-
-    markup = types.InlineKeyboardMarkup()
-    btn_retry = types.InlineKeyboardButton(
-        text='🔄 إعادة رفع الصور والبيانات', callback_data='retry_freshman'
-    )
-    markup.add(btn_retry)
-
-    bot.send_message(
-        target_user_id,
-        f'❌ عذراً، تعذر قبول طلب التوثيق الخاص بك.\n\n📌 السبب:'
-        f' {selected_reason}\n\n👇 يمكنك إعادة المحاولة بضغطة زر:',
-        reply_markup=markup,
-    )
-
-    bot.edit_message_caption(
-        caption=f'❌ تم رفض الطلب.\nالسبب: {selected_reason}',
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-    )
-
-
-# ==================== أمر القبول اليدوي الاحتياطي للأدمن ====================
-@bot.message_handler(commands=['approve_manual'])
-def manual_approve(message):
-  if not is_admin(message.from_user.id):
-    return
-  args = message.text.split()
-  if len(args) < 2:
-    bot.reply_to(message, '⚠️ اكتب الأمر هكذا:\n/approve_manual TELEGRAM_ID')
-    return
-
-  target_user_id = int(args[1].strip())
-  conn = db_connect()
-  cursor = conn.cursor()
-  cursor.execute(
-      'SELECT full_name FROM freshmen WHERE telegram_id = ?', (target_user_id,)
-  )
-  st = cursor.fetchone()
-
-  if not st:
-    bot.reply_to(message, '❌ المستخدم غير موجود.')
-    conn.close()
-    return
-
-  full_name = st[0]
-
-  try:
-    lectures_link = bot.create_chat_invite_link(
-        chat_id=FRESHMAN_LECTURES_ID, member_limit=1
-    ).invite_link
-    discussion_link = bot.create_chat_invite_link(
-        chat_id=FRESHMAN_DISCUSSION_ID, member_limit=1
-    ).invite_link
-
-    cursor.execute(
-        "UPDATE freshmen SET status = 'approved' WHERE telegram_id = ?",
-        (target_user_id,),
-    )
-    conn.commit()
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    btn1 = types.InlineKeyboardButton(
-        text='📚 الانضمام لقناة المحاضرات', url=lectures_link
-    )
-    btn2 = types.InlineKeyboardButton(
-        text='💬 الانضمام لمجموعة المناقشة', url=discussion_link
-    )
-    markup.add(btn1, btn2)
-
-    success_msg = (
-        f'🎉 مبارك قبولك وتوثيق حسابك يا {full_name}!\n\n'
-        f'أهلاً بك رسمياً في قسم الهندسة الإلكترونية والاتصالات 🎓\n'
-        f'ممثل الاتصالات : @Youssef_Sabra\n\n'
-        f'👇 إليك روابط الانضمام الخاصة بدفعتك:'
-    )
-
-    bot.send_message(target_user_id, success_msg, reply_markup=markup)
-    bot.reply_to(message, f'✅ تم قبول الطالب {full_name} بنجاح.')
-  except Exception as e:
-    bot.reply_to(message, f'❌ خطأ: {str(e)}')
-
-  conn.close()
-
-
-# ==================== التشغيل ====================
-def run_bot():
-  while True:
-    try:
-      bot.infinity_polling(skip_pending=True)
+        buf = io.BytesIO(json.dumps(backup, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+        buf.name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        bot.send_document(chat_id, buf, caption=f"📦 نسخة احتياطية (JSON)\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\nℹ️ يمكنك أيضاً تنزيل نسخة SQLite كاملة مباشرة من لوحة Turso (زر Export Database).")
+        audit(chat_id, "manual_backup")
     except Exception:
-      # هذا الخيط (Thread) يعمل بالخلفية بشكل منفصل عن سيرفر Flask؛ لو طاح
-      # بصمت هون بدون هاي الحلقة، البوت بيتوقف نهائياً عن الرد على تيليجرام
-      # بينما يبقى Render وUptimeRobot يظنون إنه شغال تمام (لأن Flask لسا
-      # شغالة وترد على فحوصات الصحة). فبنسجل الخطأ ونعيد المحاولة فوراً.
-      logger.exception('Polling stopped unexpectedly, restarting in 5s')
-      time.sleep(5)
+        logger.exception("Backup failed")
+        bot.send_message(chat_id, "❌ فشل إنشاء النسخة الاحتياطية.")
 
+# ============================================================
+# MEDIA HANDLER — FILE ID EXTRACTION, NO DB COURSE MODIFICATION
+# ============================================================
+@bot.message_handler(content_types=["document", "photo", "video", "audio", "voice"])
+def handle_media(message):
+    if not require_private(message):
+        return
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+    state = admin_states.get(uid, {})
+    file_id = None
+    file_type = None
+    if message.document:
+        file_id, file_type = message.document.file_id, "document"
+    elif message.photo:
+        file_id, file_type = message.photo[-1].file_id, "photo"
+    elif message.video:
+        file_id, file_type = message.video.file_id, "video"
+    elif message.audio:
+        file_id, file_type = message.audio.file_id, "audio"
+    elif message.voice:
+        file_id, file_type = message.voice.file_id, "voice"
+    if not file_id:
+        bot.reply_to(message, "❌ لم أستطع استخراج File ID.")
+        return
+    if state.get("action") == "exam_schedule":
+        with db_connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('exam_schedule_file_id',?)", (file_id,))
+        clear_admin_state(uid)
+        audit(uid, "exam_schedule_updated", "", f"type={file_type}")
+        bot.reply_to(message, "✅ تم حفظ ملف برنامج الاسبوع.")
+        return
+    if state.get("action") == "get_file_id":
+        clear_admin_state(uid)
+        audit(uid, "file_id_extracted", "", f"type={file_type}")
+        bot.reply_to(message, f"🔑 File ID:\n\n<code>{escape(file_id)}</code>\n\n📌 النوع: {file_type}\n\nانسخه وضعه بجانب اسم المحاضرة داخل <code>database</code> في الكود.", parse_mode="HTML")
+        return
+    # Safe default: any admin media gives the ID, but never edits course data automatically.
+    bot.reply_to(message, f"🔑 File ID:\n\n<code>{escape(file_id)}</code>\n\n📌 النوع: {file_type}", parse_mode="HTML")
 
-if __name__ == '__main__':
-  logger.info('Freshmen bot started')
-  bot_thread = Thread(target=run_bot)
-  bot_thread.daemon = True
-  bot_thread.start()
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    if not require_private(message):
+        return
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+    first_name = (message.from_user.first_name or "المهندس")[:100]
 
-  run_flask()
+    if is_user_banned(uid) and not is_admin(uid):
+        bot.send_message(chat_id, "🚫 تم حظرك من استخدام هذا البوت.")
+        return
+    if not rate_allowed(uid) and not is_admin(uid):
+        bot.send_message(chat_id, "⏳ طلبات كثيرة بسرعة. انتظر قليلًا ثم حاول مجددًا.")
+        return
 
+    add_user(uid, first_name)
+
+    try:
+        # ---------------- ADMIN ----------------
+        if is_admin(uid):
+            state = admin_states.get(uid, {})
+
+            if text == "/admin":
+                clear_admin_state(uid)
+                bot.send_message(chat_id, "🔧 <b>لوحة تحكم الأدمن</b>", reply_markup=get_admin_keyboard(), parse_mode="HTML")
+                return
+
+            if text == "📊 إحصائيات البوت":
+                users, active, downloads, favs, banned, top = get_stats()
+                msg = [f"📊 <b>إحصائيات البوت</b>", f"👥 المستخدمون: <code>{users}</code>", f"🟢 نشطون خلال 7 أيام: <code>{active}</code>",
+                       f"📥 التحميلات: <code>{downloads}</code>", f"⭐ المفضلة: <code>{favs}</code>", f"🚫 المحظورون: <code>{banned}</code>"]
+                if top:
+                    msg.append("\n🏆 <b>الأكثر طلبًا:</b>")
+                    msg += [f"• {escape(m)} — {escape(l)}: {c}" for m,l,c in top]
+                bot.send_message(chat_id, "\n".join(msg), parse_mode="HTML")
+                return
+
+            if text == "📎 استخراج File ID":
+                set_admin_state(uid, action="get_file_id")
+                bot.send_message(chat_id, "📎 أرسل الآن الملف/الصورة/الفيديو. سأعطيك File ID فقط ولن أغيّر الكود تلقائيًا.")
+                return
+
+            if text == "📸 برنامج الاسبوع":
+                set_admin_state(uid, action="exam_schedule")
+                bot.send_message(chat_id, "📸 أرسل صورة/ملف برنامج الاسبوع. سيُحفظ في قاعدة الإعدادات.")
+                return
+
+            if text == "📢 إرسال إذاعة":
+                set_admin_state(uid, action="broadcast")
+                bot.send_message(chat_id, "📢 أرسل نص الإذاعة الآن. ستعمل كـ Job مستقل مع تسجيل النجاح والفشل.\n\n❌ للإلغاء: اكتب /cancel")
+                return
+
+            if text == "📦 نسخة احتياطية":
+                send_backup(chat_id); return
+
+            if text == "🚫 حظر / إلغاء حظر مستخدم":
+                set_admin_state(uid, action="ban")
+                bot.send_message(chat_id, "أرسل User ID رقمي. إذا كان محظورًا سأفك الحظر، وإلا سأحظره.\n\n❌ /cancel")
+                return
+
+            if text == "📜 سجل الإدارة":
+                with db_connect() as conn:
+                    rows = conn.execute("SELECT action,target,created_at FROM audit_logs ORDER BY id DESC LIMIT 15").fetchall()
+                if not rows:
+                    bot.send_message(chat_id, "لا يوجد سجل بعد.")
+                else:
+                    bot.send_message(chat_id, "📜 <b>آخر عمليات الإدارة:</b>\n" + "\n".join(
+                        f"• {escape(a)} | {escape(str(t))} | {escape(str(d))}" for a,t,d in rows), parse_mode="HTML")
+                return
+
+            if text == "🧾 تجهيز سطر ملف":
+                set_admin_state(uid, action="code_line", step="year")
+                bot.send_message(chat_id, "أرسل السنة: 1 أو 2 أو 3 أو 4 أو 5.\n❌ /cancel")
+                return
+
+            if text == "🗑️ تجهيز حذف من الكود":
+                set_admin_state(uid, action="code_delete", step="year")
+                bot.send_message(chat_id, "أرسل السنة: 1 أو 2 أو 3 أو 4 أو 5.\n❌ /cancel")
+                return
+
+            if text == "🏠 العودة للرئيسية":
+                clear_admin_state(uid)
+                reset_user_state(chat_id)
+                bot.send_message(chat_id, "صلي على النبي ", reply_markup=get_years_keyboard())
+                return
+
+            # Persistent admin workflows.
+            if state.get("action") in ("broadcast", "ban", "code_line", "code_delete"):
+                if text == "/cancel":
+                    clear_admin_state(uid); bot.send_message(chat_id, "✅ تم إلغاء العملية."); return
+
+                if state["action"] == "broadcast":
+                    clear_admin_state(uid)
+                    total = start_broadcast(uid, text)
+                    bot.send_message(chat_id, f"🚀 بدأت الإذاعة كعملية مستقلة. عدد المستلمين: <code>{total}</code>", parse_mode="HTML")
+                    return
+
+                if state["action"] == "ban":
+                    clear_admin_state(uid)
+                    try:
+                        target = int(text)
+                        if target == uid:
+                            bot.send_message(chat_id, "❌ لا يمكنك حظر نفسك."); return
+                        if is_user_banned(target):
+                            unban_user(target); audit(uid,"unban_user",target); bot.send_message(chat_id, "✅ تم إلغاء الحظر.")
+                        else:
+                            ban_user(target); audit(uid,"ban_user",target); bot.send_message(chat_id, "🚫 تم الحظر.")
+                    except ValueError:
+                        bot.send_message(chat_id, "❌ User ID يجب أن يكون رقمًا.")
+                    return
+
+                action = state["action"]
+                step = state.get("step")
+                if step == "year":
+                    if text not in {"1","2","3","4","5"}:
+                        bot.send_message(chat_id, "❌ أرسل رقم السنة من 1 إلى 5."); return
+                    set_admin_state(uid, action=action, step="sem", year=int(text))
+                    bot.send_message(chat_id, "أرسل الفصل: 1 أو 2")
+                    return
+                if step == "sem":
+                    if text not in {"1","2"}:
+                        bot.send_message(chat_id, "❌ أرسل 1 أو 2."); return
+                    set_admin_state(uid, action=action, step="material", year=state["year"], sem=int(text))
+                    mats = catalog_materials(f"year_{state['year']}_sem_{int(text)}")
+                    bot.send_message(chat_id, "اختر/اكتب اسم المادة حرفيًا:\n\n" + "\n".join(f"• {m['name']}" for m in mats))
+                    return
+                if step == "material":
+                    db_key = f"year_{state['year']}_sem_{state['sem']}"
+                    mat = find_material(db_key, text)
+                    if not mat:
+                        bot.send_message(chat_id, "❌ اسم المادة غير موجود. انسخه كما يظهر في القائمة."); return
+                    set_admin_state(uid, action=action, step="lecture", year=state["year"], sem=state["sem"], material=text)
+                    bot.send_message(chat_id, "أرسل اسم المحاضرة حرفيًا، مثل: محاضرة 1 📄")
+                    return
+                if step == "lecture":
+                    db_key = f"year_{state['year']}_sem_{state['sem']}"
+                    mat = find_material(db_key, state["material"])
+                    if not mat or text not in mat.get("content", {}):
+                        bot.send_message(chat_id, "❌ اسم المحاضرة غير موجود داخل المادة."); return
+                    clear_admin_state(uid)
+                    if action == "code_line":
+                        current = mat["content"].get(text)
+                        bot.send_message(chat_id, f"🧾 <b>السطر الجاهز:</b>\n\n<code>{escape(code_snippet(db_key, state['material'], text, current if current not in ('PASTE_FILE_ID_HERE','ضع_هنا_file_id') else None))}</code>\n\n📌 إذا أردت تحديثه: أرسل الملف أولًا عبر 📎 استخراج File ID ثم ضع الـ ID مكان القيمة.", parse_mode="HTML")
+                        audit(uid,"code_line_generated",f"{db_key}/{state['material']}/{text}")
+                    else:
+                        snippet = code_snippet(db_key, state["material"], text, "PASTE_FILE_ID_HERE")
+                        bot.send_message(chat_id, f"🗑️ <b>لحذف الملف من الكود:</b> استبدل السطر الحالي بهذا السطر، ثم احذف السطر بالكامل إذا أردت إزالة زر المحاضرة أيضًا:\n\n<code>{escape(snippet)}</code>\n\nثم ارفع التعديل إلى GitHub.", parse_mode="HTML")
+                        audit(uid,"delete_snippet_generated",f"{db_key}/{state['material']}/{text}")
+                    return
+
+        # ---------------- COMMON / USER ----------------
+        if text in ("/cancel",):
+            with state_lock:
+                user_states.pop(chat_id, None)
+            bot.send_message(chat_id, "✅ تم الإلغاء.")
+            return
+
+        if text == "/start" or text == "ابدأ من جديد 🔄" or text == "🏠 العودة للرئيسية":
+            reset_user_state(chat_id)
+
+            # عند الضغط على Start: افحص الاشتراك أولاً.
+            # إذا لم يكن مشتركاً، لا تظهر رسالة الترحيب ولا السنوات.
+            if not check_sub(uid, force=True):
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ <b>يجب عليك الاشتراك في القناة أولاً لاستخدام البوت.</b>\n\n"
+                    f"📢 القناة: {escape(CHANNEL_USERNAME)}\n\n"
+                    f"👇 اشترك بالقناة ثم اضغط «تحقق من الاشتراك»." ,
+                    reply_markup=get_sub_inline_markup(),
+                    parse_mode="HTML"
+                )
+                return
+
+            # إذا كان مشتركاً، تظهر رسالة الترحيب الكاملة وتظهر السنوات تحتها.
+            welcome = (
+                f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
+                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+                f"🎓 صنع هذا البوت @Youssef_Sabra.\n"
+                f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
+            )
+            bot.send_message(
+                chat_id,
+                welcome,
+                reply_markup=get_years_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+
+        if not check_sub(uid):
+            bot.send_message(chat_id, f"⚠️ يجب عليك الاشتراك في القناة أولاً لاستخدام البوت:\n{escape(CHANNEL_USERNAME)}",
+                             reply_markup=get_sub_inline_markup(), parse_mode="HTML")
+            return
+
+        # Exam schedule
+        if text == "📅 برنامج الاسبوع":
+            with db_connect() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key='exam_schedule_file_id'").fetchone()
+            if not row:
+                bot.send_message(chat_id, "ℹ️ لم يتم رفع برنامج الاسببوع بعد.")
+            else:
+                try:
+                    bot.send_photo(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
+                except Exception:
+                    bot.send_document(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
+            return
+
+        # Feedback
+        if text == "💬 أرسل ملاحظة/استفسار":
+            if not feedback_allowed(uid):
+                bot.send_message(chat_id, "⏳ وصلت للحد المسموح للملاحظات حاليًا. حاول لاحقًا.")
+                return
+            set_user_state(chat_id, feedback=True)
+            bot.send_message(chat_id, "✍️ اكتب رسالتك الآن. /cancel للإلغاء.")
+            return
+        state = user_states.get(chat_id, {})
+        if state.get("feedback"):
+            if text == "/cancel":
+                reset_user_state(chat_id); bot.send_message(chat_id,"✅ تم الإلغاء."); return
+            reset_user_state(chat_id)
+            with db_connect() as conn:
+                cur = conn.execute("INSERT INTO feedback(user_id,first_name,message) VALUES(?,?,?)", (uid, first_name, text[:4000]))
+                fid = cur.lastrowid
+            safe = escape(text[:4000])
+            for admin_id in ADMIN_IDS:
+                try:
+                    bot.send_message(admin_id,
+                                     f"📩 <b>ملاحظة #{fid}</b>\nمن: {escape(first_name)}\nID: <code>{uid}</code>\n\n{safe}\n\nللرد: استخدم Reply على هذه الرسالة ثم اكتب الرد.", parse_mode="HTML")
+                except Exception:
+                    logger.exception("Failed to notify admin %s about feedback", admin_id)
+            bot.send_message(chat_id, "✅ تم إرسال ملاحظتك للإدارة. شكرًا لك!")
+            return
+
+        # Search
+        if text == "🔎 بحث":
+            set_user_state(chat_id, search=True)
+            bot.send_message(chat_id, "🔎 اكتب اسم المادة أو المحاضرة للبحث. /cancel للإلغاء.")
+            return
+        if state.get("search"):
+            if text == "/cancel":
+                reset_user_state(chat_id); bot.send_message(chat_id,"✅ تم الإلغاء."); return
+            reset_user_state(chat_id)
+            results = catalog_search(text)
+            if not results:
+                bot.send_message(chat_id, "❌ لم أجد نتائج."); return
+            lines = ["🔎 <b>نتائج البحث:</b>"]
+            for db_key, mat, lec in results:
+                lines.append(f"• <b>{escape(mat)}</b> — {escape(lec)}\n  <code>{db_key}</code>")
+            bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+            return
+
+        # Navigation
+        years_map = {"السنة الأولى 1️⃣":1, "السنة الثانية 2️⃣":2, "السنة الثالثة 3️⃣":3, "السنة الرابعة 4️⃣":4, "السنة الخامسة 5️⃣":5}
+        if text in years_map:
+            set_user_state(chat_id, year=years_map[text], sem=None, material=None)
+            bot.send_message(chat_id, "اختر الفصل الدراسي:", reply_markup=get_semesters_keyboard())
+            return
+
+        sems_map = {"الفصل الأول 📘":1, "الفصل الثاني 📙":2}
+        if text in sems_map:
+            year = state.get("year")
+            if not year:
+                bot.send_message(chat_id, "اختر السنة الدراسية أولاً.", reply_markup=get_years_keyboard()); return
+            sem = sems_map[text]
+            db_key = f"year_{year}_sem_{sem}"
+            set_user_state(chat_id, year=year, sem=sem, material=None)
+            bot.send_message(chat_id, f"إليك مواد السنة {year} - الفصل {sem}:", reply_markup=get_materials_keyboard(catalog_materials(db_key)))
+            return
+
+        if text == "🔙 رجوع للفصول":
+            year = state.get("year")
+            if year:
+                set_user_state(chat_id, year=year, sem=None, material=None)
+                bot.send_message(chat_id, "اختر الفصل الدراسي:", reply_markup=get_semesters_keyboard())
+            else:
+                bot.send_message(chat_id, "اختر السنة الدراسية:", reply_markup=get_years_keyboard())
+            return
+
+        if text == "🔙 رجوع للمواد":
+            year, sem = state.get("year"), state.get("sem")
+            if year and sem:
+                set_user_state(chat_id, year=year, sem=sem, material=None)
+                bot.send_message(chat_id, "اختر المادة:", reply_markup=get_materials_keyboard(catalog_materials(f"year_{year}_sem_{sem}")))
+            else:
+                bot.send_message(chat_id, "اختر السنة الدراسية:", reply_markup=get_years_keyboard())
+            return
+
+        year, sem = state.get("year"), state.get("sem")
+        if year and sem:
+            db_key = f"year_{year}_sem_{sem}"
+            mat = find_material(db_key, text)
+            if mat:
+                set_user_state(chat_id, year=year, sem=sem, material=text)
+                bot.send_message(chat_id, f"📚 اختر المحاضرة المتاحة لمادة {escape(text)}:",
+                                 reply_markup=get_content_keyboard(mat.get("content", {}), db_key, text, uid), parse_mode="HTML")
+                return
+
+       
+
+            material = state.get("material")
+            if material:
+                mat = find_material(db_key, material)
+                if mat:
+                    # Telegram قد يعيد النص مع مسافات مختلفة؛ نطابق الاسم بعد strip.
+                    content_key = next((k for k in mat.get("content", {}) if k.strip() == text.strip()), None)
+                    if content_key is not None:
+                        file_id = find_file_id(db_key, material, content_key)
+                        if not file_id:
+                            bot.send_message(chat_id, "⏳ هذه المحاضرة لم تُرفع بعد.")
+                            return
+                        try:
+                            bot.send_chat_action(chat_id, "upload_document")
+                            bot.send_document(
+                                chat_id,
+                                file_id,
+                                caption=f"📌 المادة: {material}\n📑 المحتوى: {content_key}\n\n"
+                            )
+                            record_download(uid, db_key, material, content_key)
+                        except Exception as exc:
+                            logger.exception("Document send failed for %s / %s", material, content_key)
+                            bot.send_message(chat_id, "✨ بالتوفيق والنجاح!")
+                        return
+
+    except Exception:
+        logger.exception("Unhandled message error")
+        try:
+            bot.send_message(chat_id, "⚠️ حدث خطأ مؤقت. حاول مرة أخرى لاحقًا.")
+        except Exception:
+            pass
+
+# ============================================================
+# CALLBACKS — always authorize callback user
+# ============================================================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    try:
+        uid = call.from_user.id
+        if call.data == "check_subscription":
+            ok = check_sub(uid, force=True)
+            if ok:
+                bot.answer_callback_query(call.id, "✅ تم التحقق من الاشتراك!")
+                try: bot.delete_message(call.message.chat.id, call.message.message_id)
+                except Exception: pass
+                reset_user_state(call.message.chat.id)
+                first_name = (call.from_user.first_name or "المهندس")[:100]
+                welcome = (
+                    f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
+                    f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+                    f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n"
+                    f"🎓 صنع هذا البوت @Youssef_Sabra.\n\n"
+                    f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
+                )
+                bot.send_message(
+                    call.message.chat.id,
+                    welcome,
+                    reply_markup=get_years_keyboard(),
+                    parse_mode="HTML"
+                )
+            else:
+                bot.answer_callback_query(call.id, "❌ لم يتم العثور على اشتراكك.", show_alert=True)
+        else:
+            # Future admin callbacks must pass this gate.
+            if not is_admin(uid):
+                bot.answer_callback_query(call.id, "❌ غير مصرح.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "تم")
+    except Exception:
+        logger.exception("Callback error")
+
+# ============================================================
+# SAFE STARTUP
+# ============================================================
+if __name__ == "__main__":
+    logger.info("Student bot started")
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, allowed_updates=None)
+        except Exception:
+            # لو صار خطأ عابر (متل انقطاع لحظي بالاتصال مع Turso أو تيليجرام)،
+            # ما نخلي البرنامج كله يطيح ويستنى Render يلاحظ ويعيد تشغيله (دقائق) -
+            # بنسجل الخطأ ونعيد المحاولة مباشرة بعد ثواني قليلة.
+            logger.exception("Polling stopped unexpectedly, restarting in 5s")
+            time.sleep(5)
