@@ -582,9 +582,9 @@ def run_broadcast(job_id, admin_id, text, users):
 def start_broadcast(admin_id, text):
     users = get_all_users()
     with db_connect() as conn:
-        cur = conn.execute("INSERT INTO broadcast_jobs(admin_id,content,status,total) VALUES(?,?,?,?)",
-                           (admin_id, text, "sending", len(users)))
-        job_id = cur.lastrowid
+        conn.execute("INSERT INTO broadcast_jobs(admin_id,content,status,total) VALUES(?,?,?,?)",
+                     (admin_id, text, "sending", len(users)))
+        job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     audit(admin_id, "broadcast_started", job_id, f"total={len(users)}")
     threading.Thread(target=run_broadcast, args=(job_id, admin_id, text, users), daemon=True).start()
     return len(users)
@@ -880,8 +880,8 @@ def handle_all_messages(message):
                 reset_user_state(chat_id); bot.send_message(chat_id,"✅ تم الإلغاء."); return
             reset_user_state(chat_id)
             with db_connect() as conn:
-                cur = conn.execute("INSERT INTO feedback(user_id,first_name,message) VALUES(?,?,?)", (uid, first_name, text[:4000]))
-                fid = cur.lastrowid
+                conn.execute("INSERT INTO feedback(user_id,first_name,message) VALUES(?,?,?)", (uid, first_name, text[:4000]))
+                fid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             safe = escape(text[:4000])
             for admin_id in ADMIN_IDS:
                 try:
