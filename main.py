@@ -49,6 +49,7 @@ admin_states = {}
 rate_buckets = defaultdict(deque)
 feedback_buckets = defaultdict(deque)
 subscription_cache = {}
+last_seen_cache = {}
 state_lock = threading.RLock()
 
 app = Flask(__name__)
@@ -210,10 +211,22 @@ def ban_user(user_id):
 
 def unban_user(user_id):
     with db_connect() as conn:
-        cur = conn.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
-        return cur.rowcount > 0
+        conn.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
+
+LAST_SEEN_THROTTLE = 300  # ثواني - لتقليل الاتصال بقاعدة البيانات وتسريع رد البوت
+
 
 def add_user(user_id, first_name):
+    # كل رسالة كانت تفتح اتصال جديد بـ Turso فقط لتحديث "آخر ظهور" — وهاد
+    # كان يبطّئ رد البوت بشكل ملموس. هلق نحدّثها بقاعدة البيانات كل 5 دقائق
+    # بحد أقصى لكل مستخدم بدل كل رسالة، وهاد كافي جداً لهذا الاستخدام.
+    now = time.monotonic()
+    with state_lock:
+        last = last_seen_cache.get(user_id)
+        if last is not None and now - last < LAST_SEEN_THROTTLE:
+            return
+        last_seen_cache[user_id] = now
+
     with db_connect() as conn:
         conn.execute("""INSERT INTO users(user_id, first_name) VALUES(?, ?)
                        ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name,
@@ -225,7 +238,7 @@ def mark_user_inactive(user_id):
 
 def get_all_users():
     with db_connect() as conn:
-        return [r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_active=1 ORDER BY user_id")]
+        return [r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_active=1 ORDER BY user_id").fetchall()]
 
 def get_users_count():
     with db_connect() as conn:
@@ -267,6 +280,9 @@ def cleanup_states():
             for uid in list(subscription_cache):
                 if subscription_cache[uid][1] < time.time():
                     subscription_cache.pop(uid, None)
+            for uid in list(last_seen_cache):
+                if time.monotonic() - last_seen_cache[uid] > LAST_SEEN_THROTTLE:
+                    last_seen_cache.pop(uid, None)
 
 threading.Thread(target=cleanup_states, daemon=True, name="state-cleaner").start()
 
@@ -671,7 +687,7 @@ def handle_all_messages(message):
         bot.send_message(chat_id, "🚫 تم حظرك من استخدام هذا البوت.")
         return
     if not rate_allowed(uid) and not is_admin(uid):
-        bot.send_message(chat_id, "⏳ طلبات كثيرة بسرعة. انتظر قليلًا ثم حاول مجددًا.")
+        bot.send_message(chat_id, "شوي شوي يا مهندس 👨🏻‍💼 كبسة كبسة ليش مستعجل 🙂")
         return
 
     add_user(uid, first_name)
