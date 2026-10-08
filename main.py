@@ -10,7 +10,9 @@ from datetime import datetime
 from html import escape
 from collections import defaultdict, deque
 from flask import Flask
+import re
 import telebot
+from telebot.apihelper import ApiTelegramException
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 # ============================================================
@@ -40,6 +42,168 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("student_bot")
 
 bot = telebot.TeleBot(TOKEN, threaded=True)
+
+# ============================================================
+# ✨ الإيموجي المتحرك + الأزرار الملونة + الملصقات
+# ============================================================
+# كيف تجيب الرقم؟ أرسل الإيموجي المتحرك (أو الملصق) للبوت من حساب أدمن، فيرد عليك برقمه.
+# ضع الرقم بين علامتي التنصيص. إذا تركته فاضي يظهر الإيموجي العادي (ولا يتعطل شيء).
+# ⚠️ الإيموجي المتحرك يحتاج Telegram Premium على حساب صاحب البوت (اللي أنشأه من BotFather).
+EMOJI_IDS = {
+    # أيقونات الأزرار (تظهر قبل نص الزر)
+    "year_1": "",      # ← السنة الأولى
+    "year_2": "",      # ← السنة الثانية
+    "year_3": "",      # ← السنة الثالثة
+    "year_4": "",      # ← السنة الرابعة
+    "year_5": "",      # ← السنة الخامسة
+    "feedback": "",    # ← أرسل ملاحظة/استفسار
+    "schedule": "",    # ← برنامج الاسبوع
+    # الرسالة الترحيبية
+    "welcome_hi": "",      # ← جنب «أهلاً بك»
+    "welcome_books": "",   # ← جنب «يمكنك الوصول لجميع المحاضرات...»
+    "verified": "",        # ← علامة التوثيق بعد اسم المطوّر
+}
+
+# ملصقات تُرسل كرسالة مستقلة. القيمة إما file_id لملصق عادي، أو رقم إيموجي متحرك (أرقام فقط).
+STICKERS = {
+    "welcome": "",         # ← عند /start (قبل رسالة الترحيب)
+    "file_sent": "",       # ← بعد ما ينزل للطالب ملف المحاضرة
+    "feedback_sent": "",   # ← بعد ما يرسل ملاحظته
+    "schedule_sent": "",   # ← بعد برنامج الاسبوع
+}
+
+# اختياري: بدل تعديل الكود تقدر تضعها من Render:  EMOJI_YEAR_1 ، STICKER_FILE_SENT ... إلخ
+for _k in EMOJI_IDS:
+    EMOJI_IDS[_k] = os.environ.get("EMOJI_" + _k.upper(), EMOJI_IDS[_k]).strip()
+for _k in STICKERS:
+    STICKERS[_k] = os.environ.get("STICKER_" + _k.upper(), STICKERS[_k]).strip()
+
+_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.S)
+_BTN_FALLBACK = {}   # نص الزر بالأيقونة -> نصه العادي (يُستعمل لو رفض تليجرام الأيقونة)
+
+
+def tg_emoji(key, fallback, only_if_set=False):
+    """إيموجي متحرك داخل نص HTML. إذا الرقم فاضي يرجع الإيموجي العادي (أو فراغ لو only_if_set)."""
+    eid = EMOJI_IDS.get(key, "")
+    if eid.isdigit():
+        return f'<tg-emoji emoji-id="{eid}">{fallback}</tg-emoji>'
+    return "" if only_if_set else fallback
+
+
+class StyledKeyboardButton(KeyboardButton):
+    """زر عادي + أيقونة متحركة + لون (Bot API 9.4) — يشتغل حتى لو مكتبة تليجرام قديمة."""
+
+    def __init__(self, text, icon_custom_emoji_id=None, style=None):
+        super().__init__(text)
+        self._icon_id = icon_custom_emoji_id
+        self._style = style
+
+    def to_dict(self):
+        d = super().to_dict()
+        if self._icon_id:
+            d["icon_custom_emoji_id"] = str(self._icon_id)
+        if self._style:
+            d["style"] = self._style
+        return d
+
+
+def make_btn(key, plain_text, fallback_text, style=None):
+    """إذا فيه رقم إيموجي: يظهر نص بسيط + أيقونة متحركة. وإلا: النص القديم بإيموجيه العادي."""
+    eid = EMOJI_IDS.get(key, "")
+    if eid.isdigit():
+        _BTN_FALLBACK[plain_text] = fallback_text
+        return StyledKeyboardButton(plain_text, icon_custom_emoji_id=eid, style=style)
+    return StyledKeyboardButton(fallback_text, style=style)
+
+
+# ── إرسال آمن: لو رفض تليجرام الإيموجي المتحرك/اللون نعيد الإرسال بنسخة عادية بدل ما يتعطل البوت ──
+def _markup_has(rm, key):
+    for row in (getattr(rm, "keyboard", None) or []):
+        for b in row:
+            if isinstance(b, dict) and key in b:
+                return True
+    return False
+
+
+def _strip_markup(rm, strip_style):
+    for row in (getattr(rm, "keyboard", None) or []):
+        for b in row:
+            if isinstance(b, dict):
+                if b.pop("icon_custom_emoji_id", None) is not None:
+                    b["text"] = _BTN_FALLBACK.get(b.get("text"), b.get("text"))
+                if strip_style:
+                    b.pop("style", None)
+
+
+_orig_send_message = bot.send_message
+
+
+def _send_message_safe(chat_id, text, *args, **kwargs):
+    try:
+        return _orig_send_message(chat_id, text, *args, **kwargs)
+    except ApiTelegramException as first_err:
+        rm = kwargs.get("reply_markup")
+        plain = _TG_EMOJI_RE.sub(r"\1", text) if isinstance(text, str) else text
+        changed = plain != text
+        if rm is not None and _markup_has(rm, "icon_custom_emoji_id"):
+            _strip_markup(rm, strip_style=False)
+            changed = True
+        if changed:
+            logger.warning("Custom emoji refused (%s) → retry with plain emoji", first_err)
+            try:
+                return _orig_send_message(chat_id, plain, *args, **kwargs)
+            except ApiTelegramException:
+                pass
+        if rm is not None and _markup_has(rm, "style"):
+            logger.warning("Button style refused → retry without colors")
+            _strip_markup(rm, strip_style=True)
+            return _orig_send_message(chat_id, plain, *args, **kwargs)
+        raise first_err
+
+
+bot.send_message = _send_message_safe
+
+
+def send_sticker_safe(chat_id, key, fallback="✨"):
+    """يرسل الملصق/الإيموجي الكبير المضبوط للمفتاح. يرجع True إذا انرسل. ما بيعطّل البوت أبداً."""
+    v = STICKERS.get(key, "")
+    if not v:
+        return False
+    try:
+        if v.isdigit():
+            bot.send_message(chat_id, f'<tg-emoji emoji-id="{v}">{fallback}</tg-emoji>', parse_mode="HTML")
+        else:
+            bot.send_sticker(chat_id, v)
+        return True
+    except Exception as exc:
+        logger.warning("sticker %s failed: %s", key, exc)
+        return False
+
+
+def build_welcome(first_name):
+    hi = tg_emoji("welcome_hi", "👋")
+    books = tg_emoji("welcome_books", "📚")
+    badge = tg_emoji("verified", "✅", only_if_set=True)
+    owner = "@Youssef_Sabra" + (f" {badge}" if badge else "") + "."
+    return (
+        f"{hi} <b>أهلاً بك يا {escape(first_name)}!</b>\n"
+        f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
+        f"{books} يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
+        f"🎓 صنع هذا البوت {owner}\n"
+        f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
+    )
+
+
+# نصوص الأزرار (النسخة بالأيقونة + النسخة القديمة، حتى لا ينكسر شيء عند الطلاب اللي كيبوردهم قديم)
+YEAR_BTNS = [("year_1", "السنة الأولى", "1️⃣"), ("year_2", "السنة الثانية", "2️⃣"),
+             ("year_3", "السنة الثالثة", "3️⃣"), ("year_4", "السنة الرابعة", "4️⃣"),
+             ("year_5", "السنة الخامسة", "5️⃣")]
+YEARS_MAP = {}
+for _n, (_key, _plain, _emo) in enumerate(YEAR_BTNS, start=1):
+    YEARS_MAP[_plain] = _n
+    YEARS_MAP[f"{_plain} {_emo}"] = _n
+FEEDBACK_TEXTS = {"💬 أرسل ملاحظة/استفسار", "أرسل ملاحظة/استفسار"}
+SCHEDULE_TEXTS = {"📅 برنامج الاسبوع", "برنامج الاسبوع"}
 
 # ============================================================
 # IN-MEMORY STATE (short-lived only; persistent data stays in DB)
@@ -448,10 +612,12 @@ def find_catalog_location(material_name, lecture_name):
 # ============================================================
 def get_years_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("السنة الأولى 1️⃣", "السنة الثانية 2️⃣")
-    markup.row("السنة الثالثة 3️⃣", "السنة الرابعة 4️⃣")
-    markup.row("السنة الخامسة 5️⃣")
-    markup.row("💬 أرسل ملاحظة/استفسار", "📅 برنامج الاسبوع")
+    years = [make_btn(key, plain, f"{plain} {emo}", style="primary") for key, plain, emo in YEAR_BTNS]
+    markup.row(years[0], years[1])
+    markup.row(years[2], years[3])
+    markup.row(years[4])
+    markup.row(make_btn("feedback", "أرسل ملاحظة/استفسار", "💬 أرسل ملاحظة/استفسار", style="success"),
+               make_btn("schedule", "برنامج الاسبوع", "📅 برنامج الاسبوع", style="success"))
     return markup
 
 def get_semesters_keyboard():
@@ -673,6 +839,16 @@ def handle_media(message):
     # Safe default: any admin media gives the ID, but never edits course data automatically.
     bot.reply_to(message, f"🔑 File ID:\n\n<code>{escape(file_id)}</code>\n\n📌 النوع: {file_type}", parse_mode="HTML")
 
+@bot.message_handler(content_types=["sticker"])
+def handle_sticker_id(message):
+    if not require_private(message) or not is_admin(message.from_user.id):
+        return
+    st = message.sticker
+    extra = ""
+    if getattr(st, "custom_emoji_id", None):
+        extra = f"\n\n🆔 emoji id (للإيموجي المتحرك):\n<code>{escape(str(st.custom_emoji_id))}</code>"
+    bot.reply_to(message, f"🔑 Sticker file_id:\n<code>{escape(st.file_id)}</code>{extra}", parse_mode="HTML")
+
 # ============================================================
 # TEXT HANDLER
 # ============================================================
@@ -684,6 +860,14 @@ def handle_all_messages(message):
     chat_id = message.chat.id
     text = (message.text or "").strip()
     first_name = (message.from_user.first_name or "المهندس")[:100]
+
+    # أداة للأدمن: أرسل إيموجي متحرك فيرد البوت برقمه
+    if is_admin(uid) and not admin_states.get(uid):
+        _ids = [e.custom_emoji_id for e in (message.entities or []) if getattr(e, "type", "") == "custom_emoji"]
+        if _ids:
+            bot.reply_to(message, "🆔 emoji id:\n" + "\n".join(f"<code>{escape(i)}</code>" for i in dict.fromkeys(_ids)),
+                         parse_mode="HTML")
+            return
 
     if is_user_banned(uid) and not is_admin(uid):
         bot.send_message(chat_id, "🚫 تم حظرك من استخدام هذا البوت.")
@@ -851,13 +1035,8 @@ def handle_all_messages(message):
                 return
 
             # إذا كان مشتركاً، تظهر رسالة الترحيب الكاملة وتظهر السنوات تحتها.
-            welcome = (
-                f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
-                f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n\n"
-                f"🎓 صنع هذا البوت @Youssef_Sabra.\n"
-                f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
-            )
+            welcome = build_welcome(first_name)
+            send_sticker_safe(chat_id, "welcome", "👋")
             bot.send_message(
                 chat_id,
                 welcome,
@@ -872,7 +1051,7 @@ def handle_all_messages(message):
             return
 
         # Exam schedule
-        if text == "📅 برنامج الاسبوع":
+        if text in SCHEDULE_TEXTS:
             with db_connect() as conn:
                 row = conn.execute("SELECT value FROM settings WHERE key='exam_schedule_file_id'").fetchone()
             if not row:
@@ -882,10 +1061,11 @@ def handle_all_messages(message):
                     bot.send_photo(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
                 except Exception:
                     bot.send_document(chat_id, row[0], caption="📅 برنامج الاسبوع الرسمي:")
+                send_sticker_safe(chat_id, "schedule_sent", "📅")
             return
 
         # Feedback
-        if text == "💬 أرسل ملاحظة/استفسار":
+        if text in FEEDBACK_TEXTS:
             if not feedback_allowed(uid):
                 bot.send_message(chat_id, "⏳ وصلت للحد المسموح للملاحظات حاليًا. حاول لاحقًا.")
                 return
@@ -908,6 +1088,7 @@ def handle_all_messages(message):
                 except Exception:
                     logger.exception("Failed to notify admin %s about feedback", admin_id)
             bot.send_message(chat_id, "✅ تم إرسال ملاحظتك للإدارة. شكرًا لك!")
+            send_sticker_safe(chat_id, "feedback_sent", "💌")
             return
 
         # Search
@@ -929,7 +1110,7 @@ def handle_all_messages(message):
             return
 
         # Navigation
-        years_map = {"السنة الأولى 1️⃣":1, "السنة الثانية 2️⃣":2, "السنة الثالثة 3️⃣":3, "السنة الرابعة 4️⃣":4, "السنة الخامسة 5️⃣":5}
+        years_map = YEARS_MAP
         if text in years_map:
             set_user_state(chat_id, year=years_map[text], sem=None, material=None)
             bot.send_message(chat_id, "اختر الفصل الدراسي:", reply_markup=get_semesters_keyboard())
@@ -994,10 +1175,14 @@ def handle_all_messages(message):
                                 file_id,
                                 caption=f"📌 المادة: {material}\n📑 المحتوى: {content_key}\n\n"
                             )
-                            record_download(uid, db_key, material, content_key)
+                            send_sticker_safe(chat_id, "file_sent", "🎉")
+                            try:
+                                record_download(uid, db_key, material, content_key)
+                            except Exception:
+                                logger.exception("record_download failed")
                         except Exception as exc:
                             logger.exception("Document send failed for %s / %s", material, content_key)
-                            bot.send_message(chat_id, "✨ بالتوفيق والنجاح!")
+                            bot.send_message(chat_id, "⚠️ تعذّر إرسال الملف الآن، حاول مرة ثانية بعد قليل.")
                         return
 
     except Exception:
@@ -1022,13 +1207,8 @@ def callback_handler(call):
                 except Exception: pass
                 reset_user_state(call.message.chat.id)
                 first_name = (call.from_user.first_name or "المهندس")[:100]
-                welcome = (
-                    f"👋 <b>أهلاً بك يا {escape(first_name)}!</b>\n"
-                    f"🎓 مرحباً بك في بوت الاتصالات المساعد.\n"
-                    f"📚 يمكنك الوصول لجميع المحاضرات والمقررات بسهولة.\n"
-                    f"🎓 صنع هذا البوت @Youssef_Sabra.\n\n"
-                    f"👇 <b>يرجى اختيار السنة الدراسية للبدء:</b>"
-                )
+                welcome = build_welcome(first_name)
+                send_sticker_safe(call.message.chat.id, "welcome", "👋")
                 bot.send_message(
                     call.message.chat.id,
                     welcome,
