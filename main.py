@@ -11,6 +11,7 @@ from html import escape
 from collections import defaultdict, deque
 from flask import Flask
 import re
+import random
 import telebot
 from telebot.apihelper import ApiTelegramException
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -58,6 +59,15 @@ EMOJI_IDS = {
     "year_5": "",      # ← السنة الخامسة
     "feedback": "",    # ← أرسل ملاحظة/استفسار
     "schedule": "",    # ← برنامج الاسبوع
+    # أزرار التنقل (كلها حمراء تلقائياً)
+    "sem_1": "",           # ← الفصل الأول (بدل 📘)
+    "sem_2": "",           # ← الفصل الثاني (بدل 📙)
+    "home": "",            # ← العودة للرئيسية
+    "back_materials": "",  # ← رجوع للمواد
+    "back_semesters": "",  # ← رجوع للفصول
+    # أزرار المحاضرات
+    "lecture": "",         # ← أيقونة واحدة لكل أزرار المحاضرات والجلسات (بدل 📄)
+    "past_exams": "",      # ← زر «دورات سابقة» (إذا تركته فاضي يأخذ أيقونة المحاضرات)
     # الرسالة الترحيبية
     "welcome_hi": "",      # ← جنب «أهلاً بك»
     "welcome_books": "",   # ← جنب «يمكنك الوصول لجميع المحاضرات...»
@@ -70,7 +80,10 @@ STICKERS = {
     "file_sent": "",       # ← بعد ما ينزل للطالب ملف المحاضرة
     "feedback_sent": "",   # ← بعد ما يرسل ملاحظته
     "schedule_sent": "",   # ← بعد برنامج الاسبوع
+    "not_uploaded": "",    # ← لما يطلب محاضرة لسا ما انرفعت
 }
+# 💡 نصيحة: بأي خانة من خانات STICKERS تقدر تحط أكثر من ملصق مفصولين بفاصلة (,)
+#    والبوت يختار واحد عشوائي كل مرة — فكل طالب بيشوف ملصق مختلف!
 
 # اختياري: بدل تعديل الكود تقدر تضعها من Render:  EMOJI_YEAR_1 ، STICKER_FILE_SENT ... إلخ
 for _k in EMOJI_IDS:
@@ -107,13 +120,31 @@ class StyledKeyboardButton(KeyboardButton):
         return d
 
 
+# مكان الأيقونة بالزر: "left" = يسار الكلمة ، "right" = يمين الكلمة
+# (الأيقونة تظهر "قبل" النص، وبالعربي القبل = اليمين. لنقلها لليسار نجعل اتجاه نص الزر من اليسار لليمين.)
+# إذا ما تغير المكان عندك جرّب "right" — يمكن تغييرها من Render: ICON_SIDE
+ICON_SIDE = os.environ.get("ICON_SIDE", "left").strip().lower()
+_LRM = "\u200e"
+
+
 def make_btn(key, plain_text, fallback_text, style=None):
     """إذا فيه رقم إيموجي: يظهر نص بسيط + أيقونة متحركة. وإلا: النص القديم بإيموجيه العادي."""
     eid = EMOJI_IDS.get(key, "")
     if eid.isdigit():
-        _BTN_FALLBACK[plain_text] = fallback_text
-        return StyledKeyboardButton(plain_text, icon_custom_emoji_id=eid, style=style)
+        shown = (_LRM + plain_text) if ICON_SIDE == "left" else plain_text
+        _BTN_FALLBACK[shown] = fallback_text
+        return StyledKeyboardButton(shown, icon_custom_emoji_id=eid, style=style)
     return StyledKeyboardButton(fallback_text, style=style)
+
+
+def norm_btn_text(t):
+    """يشيل علامات الاتجاه الخفية اللي نضيفها لنص الزر."""
+    return re.sub(r"[\u200e\u200f\u202a-\u202e]", "", t or "").strip()
+
+
+def lecture_label(key):
+    """اسم المحاضرة بدون إيموجي 📄/📝 وبدون مسافات زائدة (يُستعمل لما تكون الأيقونة المتحركة هي البديل)."""
+    return re.sub(r"\s+", " ", norm_btn_text(key).replace("📄", "").replace("📝", "")).strip()
 
 
 # ── إرسال آمن: لو رفض تليجرام الإيموجي المتحرك/اللون نعيد الإرسال بنسخة عادية بدل ما يتعطل البوت ──
@@ -166,9 +197,10 @@ bot.send_message = _send_message_safe
 
 def send_sticker_safe(chat_id, key, fallback="✨"):
     """يرسل الملصق/الإيموجي الكبير المضبوط للمفتاح. يرجع True إذا انرسل. ما بيعطّل البوت أبداً."""
-    v = STICKERS.get(key, "")
-    if not v:
+    options = [x.strip() for x in STICKERS.get(key, "").split(",") if x.strip()]
+    if not options:
         return False
+    v = random.choice(options)
     try:
         if v.isdigit():
             bot.send_message(chat_id, f'<tg-emoji emoji-id="{v}">{fallback}</tg-emoji>', parse_mode="HTML")
@@ -202,6 +234,10 @@ YEARS_MAP = {}
 for _n, (_key, _plain, _emo) in enumerate(YEAR_BTNS, start=1):
     YEARS_MAP[_plain] = _n
     YEARS_MAP[f"{_plain} {_emo}"] = _n
+HOME_TEXTS = {"🏠 العودة للرئيسية", "العودة للرئيسية"}
+BACK_SEM_TEXTS = {"🔙 رجوع للفصول", "رجوع للفصول"}
+BACK_MAT_TEXTS = {"🔙 رجوع للمواد", "رجوع للمواد"}
+SEMS_MAP = {"الفصل الأول 📘": 1, "الفصل الثاني 📙": 2, "الفصل الأول": 1, "الفصل الثاني": 2}
 FEEDBACK_TEXTS = {"💬 أرسل ملاحظة/استفسار", "أرسل ملاحظة/استفسار"}
 SCHEDULE_TEXTS = {"📅 برنامج الاسبوع", "برنامج الاسبوع"}
 
@@ -493,7 +529,7 @@ database = {'year_1_sem_1': [{'name': 'رياضيات1 📐', 'content': {'مح�
             
              'year_2_sem_1': [{'name': 'رياضيات3 📐', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAJ112q_zNLpaH8YDish6H7zqq2wrtkCAAJnIwACA9MBUv5uGIalZSkSPQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAJ12Wq_zOBR6CjhQ5i-fJW8Wydl4s2pAAJoIwACA9MBUqOk_56hUxr9PQQ', 'تمارين المحاضرة 1+2 📄': 'BQACAgQAAxkBAAJ122q_zOgSSErhMpphB7RrZCFdxtesAAJpIwACA9MBUvysHiUAAfBahT0E', 'تمارين اضافية 📄': 'BQACAgQAAxkBAAEBBipqxnx9FWhD5e-_ujF79Ix7CWAjOQACqSsAAuZRMVLqAAEc-dUW21Y9BA', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
                              {'name': 'الكترون ⚡', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAKsUGrC3Xh8Ti5UpszrD1b1uiSr0lp8AAJIIAACho4YUuaCfxnSEZ_9PQQ', 'محاضرة 2 📄': 'BQACAgQAAxkBAAEBBixqxn0w0b0KgiA9Cpxzrr24PhVj2wAC6B8AAoUyMFKDPTW0Vzy2tz0E', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
-                             {'name': 'oop 💻', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAEBJadqx7XPcDeAw8liHUP6hSQrDYQbtgAC1B8AAvtxQVLd0A2f7afLST0E', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
+                             {'name': 'oop 💻', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
                              {'name': 'تصميم 🧩', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAJg1Gq-jeUTsx4B0U7yY09Aa_XQxsTXAAJhGwACbXjwUZBsqH7HT1IlPQQ', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
                              {'name': 'لغة3 🇬🇧', 'content': {'محاضرة 1 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 3 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 4 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 5 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 6 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 7 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 8 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 9 📄': 'PASTE_FILE_ID_HERE', 'محاضرة 10 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}},
                              {'name': 'بني تحتية 🏥', 'content': {'محاضرة 1 📄': 'BQACAgQAAxkBAAKsT2rC3Xg_OzjLAR8Q7_mt5GTNHcXIAAJHIAACho4YUnowRQQZhn3QPQQ', 'محاضرة 2 📄': 'PASTE_FILE_ID_HERE', '📝 دورات سابقة': 'PASTE_FILE_ID_HERE'}}, 
@@ -622,8 +658,9 @@ def get_years_keyboard():
 
 def get_semesters_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("الفصل الأول 📘", "الفصل الثاني 📙")
-    markup.row("🏠 العودة للرئيسية")
+    markup.row(make_btn("sem_1", "الفصل الأول", "الفصل الأول 📘", style="danger"),
+               make_btn("sem_2", "الفصل الثاني", "الفصل الثاني 📙", style="danger"))
+    markup.row(make_btn("home", "العودة للرئيسية", "🏠 العودة للرئيسية", style="danger"))
     return markup
 
 def get_materials_keyboard(materials_list):
@@ -634,7 +671,8 @@ def get_materials_keyboard(materials_list):
         if len(row) == 2:
             markup.row(*row); row = []
     if row: markup.row(*row)
-    markup.row("🔙 رجوع للفصول", "🏠 العودة للرئيسية")
+    markup.row(make_btn("back_semesters", "رجوع للفصول", "🔙 رجوع للفصول", style="danger"),
+               make_btn("home", "العودة للرئيسية", "🏠 العودة للرئيسية", style="danger"))
     return markup
 
 def get_content_keyboard(content_dict, db_key, material_name, user_id):
@@ -643,13 +681,15 @@ def get_content_keyboard(content_dict, db_key, material_name, user_id):
     for key, value in content_dict.items():
         if key == "📝 دورات سابقة":
             continue
-        row.append(KeyboardButton(key))
+        row.append(make_btn("lecture", lecture_label(key), key))   # بدون أيقونة = الزر القديم بالضبط
         if len(row) == 2:
             markup.row(*row); row = []
     if row: markup.row(*row)
     if "📝 دورات سابقة" in content_dict:
-        markup.row("📝 دورات سابقة")
-    markup.row("🔙 رجوع للمواد", "🏠 العودة للرئيسية")
+        markup.row(make_btn("past_exams" if EMOJI_IDS.get("past_exams") else "lecture",
+                            "دورات سابقة", "📝 دورات سابقة"))
+    markup.row(make_btn("back_materials", "رجوع للمواد", "🔙 رجوع للمواد", style="danger"),
+               make_btn("home", "العودة للرئيسية", "🏠 العودة للرئيسية", style="danger"))
     return markup
 
 def get_admin_keyboard():
@@ -858,7 +898,7 @@ def handle_all_messages(message):
         return
     uid = message.from_user.id
     chat_id = message.chat.id
-    text = (message.text or "").strip()
+    text = norm_btn_text(message.text)
     first_name = (message.from_user.first_name or "المهندس")[:100]
 
     # أداة للأدمن: أرسل إيموجي متحرك فيرد البوت برقمه
@@ -941,7 +981,7 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, "أرسل السنة: 1 أو 2 أو 3 أو 4 أو 5.\n❌ /cancel")
                 return
 
-            if text == "🏠 العودة للرئيسية":
+            if text in HOME_TEXTS:
                 clear_admin_state(uid)
                 reset_user_state(chat_id)
                 bot.send_message(chat_id, "صلي على النبي ", reply_markup=get_years_keyboard())
@@ -1018,7 +1058,7 @@ def handle_all_messages(message):
             bot.send_message(chat_id, "✅ تم الإلغاء.")
             return
 
-        if text == "/start" or text == "ابدأ من جديد 🔄" or text == "🏠 العودة للرئيسية":
+        if text == "/start" or text == "ابدأ من جديد 🔄" or text in HOME_TEXTS:
             reset_user_state(chat_id)
 
             # عند الضغط على Start: افحص الاشتراك أولاً.
@@ -1116,7 +1156,7 @@ def handle_all_messages(message):
             bot.send_message(chat_id, "اختر الفصل الدراسي:", reply_markup=get_semesters_keyboard())
             return
 
-        sems_map = {"الفصل الأول 📘":1, "الفصل الثاني 📙":2}
+        sems_map = SEMS_MAP
         if text in sems_map:
             year = state.get("year")
             if not year:
@@ -1127,7 +1167,7 @@ def handle_all_messages(message):
             bot.send_message(chat_id, f"إليك مواد السنة {year} - الفصل {sem}:", reply_markup=get_materials_keyboard(catalog_materials(db_key)))
             return
 
-        if text == "🔙 رجوع للفصول":
+        if text in BACK_SEM_TEXTS:
             year = state.get("year")
             if year:
                 set_user_state(chat_id, year=year, sem=None, material=None)
@@ -1136,7 +1176,7 @@ def handle_all_messages(message):
                 bot.send_message(chat_id, "اختر السنة الدراسية:", reply_markup=get_years_keyboard())
             return
 
-        if text == "🔙 رجوع للمواد":
+        if text in BACK_MAT_TEXTS:
             year, sem = state.get("year"), state.get("sem")
             if year and sem:
                 set_user_state(chat_id, year=year, sem=sem, material=None)
@@ -1163,10 +1203,14 @@ def handle_all_messages(message):
                 if mat:
                     # Telegram قد يعيد النص مع مسافات مختلفة؛ نطابق الاسم بعد strip.
                     content_key = next((k for k in mat.get("content", {}) if k.strip() == text.strip()), None)
+                    if content_key is None:   # الزر بالأيقونة المتحركة: الاسم بدون 📄
+                        wanted = lecture_label(text)
+                        content_key = next((k for k in mat.get("content", {}) if lecture_label(k) == wanted), None)
                     if content_key is not None:
                         file_id = find_file_id(db_key, material, content_key)
                         if not file_id:
                             bot.send_message(chat_id, "⏳ هذه المحاضرة لم تُرفع بعد.")
+                            send_sticker_safe(chat_id, "not_uploaded", "⏳")
                             return
                         try:
                             bot.send_chat_action(chat_id, "upload_document")
